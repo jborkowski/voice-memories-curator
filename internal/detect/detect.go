@@ -66,16 +66,18 @@ func Run(db *sql.DB, cfg *config.Config) error {
 		db.Exec("CREATE TEMP TABLE local_pending (recording_id BIGINT)")
 	}
 
-	rows, err := db.Query("SELECT column_name FROM information_schema.columns WHERE table_name = 'ZCLOUDRECORDING'")
+	rows, err := db.Query("SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'ZCLOUDRECORDING'")
 	if err != nil {
 		return fmt.Errorf("failed to inspect ZCLOUDRECORDING schema: %w", err)
 	}
 
 	cols := make(map[string]bool)
+	colTypes := make(map[string]string)
 	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err == nil {
+		var name, dtype string
+		if err := rows.Scan(&name, &dtype); err == nil {
 			cols[strings.ToUpper(name)] = true
+			colTypes[strings.ToUpper(name)] = strings.ToUpper(dtype)
 		}
 	}
 	rows.Close()
@@ -144,6 +146,14 @@ func Run(db *sql.DB, cfg *config.Config) error {
 
 	recordingsDir := filepath.Dir(appleDBPath)
 
+	// Build timestamp expression based on ZDATE column type
+	var dateExpr string
+	if colTypes["ZDATE"] == "TIMESTAMP" {
+		dateExpr = "CAST(strftime(ZDATE + INTERVAL '978307200 seconds', '%Y-%m-%dT%H:%M:%SZ') AS VARCHAR)"
+	} else {
+		dateExpr = "CAST(strftime(CAST(to_timestamp(CAST(ZDATE AS DOUBLE) + 978307200) AS TIMESTAMP), '%Y-%m-%dT%H:%M:%SZ') AS VARCHAR)"
+	}
+
 	copyQuery := fmt.Sprintf(`
 		COPY (
 			SELECT 
@@ -151,7 +161,7 @@ func Run(db *sql.DB, cfg *config.Config) error {
 				CAST(NULL AS BLOB) AS audio,
 				CAST('%s/' || ZPATH AS VARCHAR) AS audio_path,
 				%s AS title,
-				CAST(strftime(CAST(to_timestamp(ZDATE + 978307200) AS TIMESTAMP), '%%Y-%%m-%%dT%%H:%%M:%%SZ') AS VARCHAR) AS created_at,
+				%s AS created_at,
 				%s AS duration_seconds,
 				%s AS transcription,
 				%s AS latitude,
@@ -163,7 +173,7 @@ func Run(db *sql.DB, cfg *config.Config) error {
 			WHERE Z_PK NOT IN (SELECT recording_id FROM uploaded)
 			  AND Z_PK NOT IN (SELECT recording_id FROM local_pending)
 		) TO '%s' (FORMAT PARQUET)
-	`, strings.ReplaceAll(recordingsDir, "'", "''"), titleCol, durationCol, transcriptionCol, latCol, lonCol, placeCol, deviceCol, folderCol, tempShardPath)
+	`, strings.ReplaceAll(recordingsDir, "'", "''"), titleCol, dateExpr, durationCol, transcriptionCol, latCol, lonCol, placeCol, deviceCol, folderCol, tempShardPath)
 
 	var rowsWritten int64
 	if err := db.QueryRow(copyQuery).Scan(&rowsWritten); err != nil {
