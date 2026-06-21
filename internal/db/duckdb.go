@@ -35,12 +35,6 @@ func InitDB() (*DuckDB, error) {
 		return nil, fmt.Errorf("failed to install/load sqlite extension: %w", err)
 	}
 
-	// Install and load httpfs for huggingface protocol support
-	if _, err := db.Exec("INSTALL httpfs; LOAD httpfs;"); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("failed to install/load httpfs extension: %w", err)
-	}
-
 	return &DuckDB{db: db}, nil
 }
 

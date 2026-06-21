@@ -75,18 +75,8 @@ func Run(db *sql.DB, cfg *config.Config) error {
 
 	slog.Info(fmt.Sprintf("%d shards ready for upload", len(readyShards)))
 
-	// #region agent log
-	debugLog("D", "upload.go:start_uploads", "beginning upload loop", map[string]interface{}{"count": len(readyShards)})
-	// #endregion
-
 	for _, shardPath := range readyShards {
-		// #region agent log
-		debugLog("D", "upload.go:upload_shard", "uploading shard", map[string]interface{}{"shard": filepath.Base(shardPath)})
-		// #endregion
 		if err := uploadShard(db, cfg, shardPath); err != nil {
-			// #region agent log
-			debugLog("D", "upload.go:upload_fail", "shard upload failed", map[string]interface{}{"shard": filepath.Base(shardPath), "error": err.Error()})
-			// #endregion
 			slog.Error("failed to upload shard", "shard", shardPath, "error", err)
 			continue
 		}
