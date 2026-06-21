@@ -166,10 +166,9 @@ func uploadShard(db *sql.DB, cfg *config.Config, shardPath string) error {
 		return fmt.Errorf("failed to create data dir: %w", err)
 	}
 
-	// Ensure dataset card exists with audio feature metadata
+	// Always write the dataset card so feature metadata stays current.
 	readmePath := filepath.Join(repoDir, "README.md")
-	if _, err := os.Stat(readmePath); os.IsNotExist(err) {
-		card := `---
+	card := `---
 configs:
   - config_name: default
     data_files:
@@ -207,9 +206,8 @@ license: other
 
 Private dataset of Apple Voice Memos, transcoded to FLAC 16kHz mono.
 `
-		os.WriteFile(readmePath, []byte(card), 0644)
-		gitCmd(repoDir, "add", "README.md")
-	}
+	os.WriteFile(readmePath, []byte(card), 0644)
+	gitCmd(repoDir, "add", "README.md")
 
 	// Copy the exported parquet into data/
 	fileName := filepath.Base(shardPath)
