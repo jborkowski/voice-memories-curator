@@ -1,7 +1,7 @@
 class Vmc < Formula
   desc "Voice Memories Curator — extracts macOS Voice Memos to Hugging Face"
-  homepage "https://github.com/jborkowski/vmc"
-  # url / sha256 — placeholder for actual release tarball
+  homepage "https://github.com/jborkowski/voice-memories-curator"
+  head "https://github.com/jborkowski/voice-memories-curator.git", branch: "main"
   license "MIT"
 
   depends_on :macos

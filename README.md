@@ -7,11 +7,11 @@ A macOS daemon that periodically extracts macOS Voice Memos, transcodes audio to
 ### Homebrew (recommended)
 
 ```bash
-brew tap jborkowski/vmc
-brew install vmc
+brew tap jborkowski/vmc https://github.com/jborkowski/voice-memories-curator
+brew install --HEAD vmc
 ```
 
-This installs `vmc` and its dependency `ffmpeg` automatically.
+This installs `vmc` and its dependencies (`ffmpeg`, `git-xet`) automatically.
 
 To run as a background service (syncs every hour):
 
