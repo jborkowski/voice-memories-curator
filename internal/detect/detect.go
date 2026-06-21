@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -38,7 +39,18 @@ func Run(db *sql.DB, cfg *config.Config) error {
 
 	attachQuery := fmt.Sprintf("ATTACH '%s' AS apple (TYPE sqlite, READ_ONLY);", strings.ReplaceAll(appleDBPath, "'", "''"))
 	if err := attachWithRetry(db, attachQuery, 5); err != nil {
-		return fmt.Errorf("failed to attach Voice Memos database: %w", err)
+		// DuckDB sqlite extension can't open the file (likely locked by iCloud/VoiceMemos).
+		// Fall back to copying the DB to a temp file and reading the copy.
+		slog.Warn("direct ATTACH failed, copying DB to temp file", "error", err)
+		tmpCopy, copyErr := copyDBToTemp(appleDBPath)
+		if copyErr != nil {
+			return fmt.Errorf("failed to attach Voice Memos database (direct and copy both failed): direct=%w, copy=%v", err, copyErr)
+		}
+		defer os.Remove(tmpCopy)
+		attachCopy := fmt.Sprintf("ATTACH '%s' AS apple (TYPE sqlite, READ_ONLY);", strings.ReplaceAll(tmpCopy, "'", "''"))
+		if _, attachErr := db.Exec(attachCopy); attachErr != nil {
+			return fmt.Errorf("failed to attach copied Voice Memos database: %w", attachErr)
+		}
 	}
 	defer db.Exec("DETACH apple;")
 	defer db.Exec("DROP TABLE IF EXISTS uploaded")
@@ -253,6 +265,27 @@ func attachWithRetry(db *sql.DB, query string, maxAttempts int) error {
 		return nil
 	}
 	return lastErr
+}
+
+func copyDBToTemp(srcPath string) (string, error) {
+	src, err := os.Open(srcPath)
+	if err != nil {
+		return "", err
+	}
+	defer src.Close()
+
+	tmp, err := os.CreateTemp("", "vmc_voicememos_*.db")
+	if err != nil {
+		return "", err
+	}
+
+	if _, err := io.Copy(tmp, src); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		return "", err
+	}
+	tmp.Close()
+	return tmp.Name(), nil
 }
 
 // fetchRemoteRecordingIDs uses the HuggingFace API to list parquet files in the
