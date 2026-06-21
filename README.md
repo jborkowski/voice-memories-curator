@@ -4,10 +4,17 @@ A macOS daemon that periodically extracts macOS Voice Memos, transcodes audio to
 
 ## Building
 
-Requires macOS Apple Silicon (darwin/arm64) and CGO enabled.
+Requires macOS Apple Silicon (darwin/arm64) and CGO enabled (for DuckDB).
 
 ```bash
-CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 go build -o vmc
+make build
+```
+
+Other targets:
+
+```bash
+make run    # build + run
+make clean  # remove binary
 ```
 
 ## Configuration
