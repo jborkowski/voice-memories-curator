@@ -241,6 +241,15 @@ Private dataset of Apple Voice Memos, transcoded to FLAC 16kHz mono.
 	}
 
 	if err := gitCmd(repoDir, "push"); err != nil {
+		// Retry with pull --rebase in case remote has new commits
+		if pullErr := gitCmd(repoDir, "pull", "--rebase"); pullErr == nil {
+			if retryErr := gitCmd(repoDir, "push"); retryErr == nil {
+				slog.Info("successfully uploaded shard to HF", "shard", shardPath, "repo", cfg.HFRepo, "path", "data/"+fileName)
+				return nil
+			} else {
+				return fmt.Errorf("git push failed after rebase: %w", retryErr)
+			}
+		}
 		return fmt.Errorf("git push failed: %w", err)
 	}
 
