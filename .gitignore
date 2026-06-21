@@ -16,3 +16,6 @@ __pycache__/
 vmc
 test.sqlite
 testdata/sample.m4a
+
+# pi (coding agent) local state
+.pi/
