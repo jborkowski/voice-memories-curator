@@ -170,6 +170,11 @@ func uploadShard(db *sql.DB, cfg *config.Config, shardPath string) error {
 	readmePath := filepath.Join(repoDir, "README.md")
 	if _, err := os.Stat(readmePath); os.IsNotExist(err) {
 		card := `---
+configs:
+  - config_name: default
+    data_files:
+      - split: train
+        path: "data/*.parquet"
 dataset_info:
   features:
     - name: recording_id
