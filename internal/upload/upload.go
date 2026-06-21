@@ -3,7 +3,6 @@ package upload
 import (
 	"bytes"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -15,26 +14,6 @@ import (
 
 	"github.com/jborkowski/vmc/internal/config"
 )
-
-const debugLogPath = "/Users/jonatan/sources/voice-momories-curator/.cursor/debug-a0a063.log"
-
-func debugLog(hypothesisID, location, message string, data map[string]interface{}) {
-	entry := map[string]interface{}{
-		"sessionId":    "a0a063",
-		"hypothesisId": hypothesisID,
-		"location":     location,
-		"message":      message,
-		"data":         data,
-		"timestamp":    time.Now().UnixMilli(),
-	}
-	b, _ := json.Marshal(entry)
-	f, err := os.OpenFile(debugLogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return
-	}
-	f.Write(append(b, '\n'))
-	f.Close()
-}
 
 func Run(db *sql.DB, cfg *config.Config) error {
 	if cfg.HFToken == "" {

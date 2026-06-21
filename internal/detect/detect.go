@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,26 +13,6 @@ import (
 
 	"github.com/jborkowski/vmc/internal/config"
 )
-
-const debugLogPath = "/Users/jonatan/sources/voice-momories-curator/.cursor/debug-a0a063.log"
-
-func debugLog(hypothesisID, location, message string, data map[string]interface{}) {
-	entry := map[string]interface{}{
-		"sessionId":    "a0a063",
-		"hypothesisId": hypothesisID,
-		"location":     location,
-		"message":      message,
-		"data":         data,
-		"timestamp":    time.Now().UnixMilli(),
-	}
-	b, _ := json.Marshal(entry)
-	f, err := os.OpenFile(debugLogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return
-	}
-	f.Write(append(b, '\n'))
-	f.Close()
-}
 
 func Run(db *sql.DB, cfg *config.Config) error {
 	homeDir, err := os.UserHomeDir()
@@ -56,60 +37,30 @@ func Run(db *sql.DB, cfg *config.Config) error {
 	}
 
 	attachQuery := fmt.Sprintf("ATTACH '%s' AS apple (TYPE sqlite, READ_ONLY);", strings.ReplaceAll(appleDBPath, "'", "''"))
-	// #region agent log
-	debugLog("C", "detect.go:attach", "attempting sqlite ATTACH", map[string]interface{}{"path": appleDBPath})
-	// #endregion
-	if _, err := db.Exec(attachQuery); err != nil {
-		// #region agent log
-		debugLog("C", "detect.go:attach_fail", "ATTACH failed", map[string]interface{}{"error": err.Error()})
-		// #endregion
+	if err := attachWithRetry(db, attachQuery, 3); err != nil {
 		return fmt.Errorf("failed to attach Voice Memos database: %w", err)
 	}
-	// #region agent log
-	debugLog("C", "detect.go:attach_ok", "ATTACH succeeded", nil)
-	// #endregion
 	defer db.Exec("DETACH apple;")
 	defer db.Exec("DROP TABLE IF EXISTS uploaded")
 	defer db.Exec("DROP TABLE IF EXISTS local_pending")
 
 	dedupMode := "local+hf"
-	if cfg.HFToken != "" {
-		// #region agent log
-		debugLog("A", "detect.go:secret", "creating HF secret", map[string]interface{}{"token_len": len(cfg.HFToken)})
-		// #endregion
-		if _, err := db.Exec(fmt.Sprintf("CREATE OR REPLACE SECRET hf_secret (TYPE HUGGINGFACE, TOKEN '%s');", cfg.HFToken)); err != nil {
-			// #region agent log
-			debugLog("A", "detect.go:secret_fail", "HF secret creation failed", map[string]interface{}{"error": err.Error()})
-			// #endregion
-			slog.Warn("Failed to set HF token", "error", err)
+	if cfg.HFToken != "" && cfg.HFRepo != "" {
+		ids, err := fetchRemoteRecordingIDs(cfg)
+		if err != nil {
+			slog.Warn("HF remote dedup failed, falling back to local-only", "error", err)
+			dedupMode = "local-only"
+			db.Exec("CREATE TEMP TABLE uploaded (recording_id BIGINT)")
 		} else {
-			// #region agent log
-			debugLog("A", "detect.go:secret_ok", "HF secret created successfully", nil)
-			// #endregion
+			if err := createUploadedTable(db, ids); err != nil {
+				slog.Warn("failed to create uploaded table from HF data", "error", err)
+				db.Exec("CREATE TEMP TABLE uploaded (recording_id BIGINT)")
+				dedupMode = "local-only"
+			}
 		}
 	} else {
-		// #region agent log
-		debugLog("B", "detect.go:no_token", "HFToken is empty", nil)
-		// #endregion
-	}
-
-	db.Exec("SET http_max_scan_size = 0")
-
-	// #region agent log
-	debugLog("E", "detect.go:hf_query", "about to run hf:// query", map[string]interface{}{"repo": cfg.HFRepo})
-	// #endregion
-	hfQuery := fmt.Sprintf("SELECT recording_id FROM 'hf://datasets/%s/data/*.parquet'", cfg.HFRepo)
-	if _, err := db.Exec(fmt.Sprintf("CREATE TEMP TABLE uploaded AS %s", hfQuery)); err != nil {
-		// #region agent log
-		debugLog("E", "detect.go:hf_query_fail", "hf:// query failed", map[string]interface{}{"error": err.Error()})
-		// #endregion
-		slog.Warn("HF query failed, falling back to local-only dedup", "error", err)
 		dedupMode = "local-only"
 		db.Exec("CREATE TEMP TABLE uploaded (recording_id BIGINT)")
-	} else {
-		// #region agent log
-		debugLog("E", "detect.go:hf_query_ok", "hf:// query succeeded", nil)
-		// #endregion
 	}
 
 	localShardsPattern := filepath.Join(shardDir, "*.parquet")
@@ -212,7 +163,6 @@ func Run(db *sql.DB, cfg *config.Config) error {
 		shardMaxRows = 10
 	}
 
-	// Count how many new memos we have
 	var totalNew int64
 	countQuery := `SELECT COUNT(*) FROM apple.ZCLOUDRECORDING
 		WHERE Z_PK NOT IN (SELECT recording_id FROM uploaded)
@@ -226,7 +176,6 @@ func Run(db *sql.DB, cfg *config.Config) error {
 		return nil
 	}
 
-	// Write shards in batches of shardMaxRows
 	var totalWritten int64
 	for offset := int64(0); offset < totalNew; offset += int64(shardMaxRows) {
 		maxShard++
@@ -281,5 +230,161 @@ func Run(db *sql.DB, cfg *config.Config) error {
 		slog.String("dedup_mode", dedupMode),
 	)
 
+	return nil
+}
+
+func attachWithRetry(db *sql.DB, query string, maxAttempts int) error {
+	var lastErr error
+	for i := 0; i < maxAttempts; i++ {
+		if _, err := db.Exec(query); err != nil {
+			lastErr = err
+			slog.Warn("sqlite ATTACH failed, retrying", "attempt", i+1, "error", err)
+			time.Sleep(time.Duration(i+1) * 500 * time.Millisecond)
+			continue
+		}
+		return nil
+	}
+	return lastErr
+}
+
+// fetchRemoteRecordingIDs uses the HuggingFace API to list parquet files in the
+// dataset repo, then reads recording_ids from each via DuckDB over HTTPS with
+// Bearer auth — no reliance on DuckDB's broken hf:// protocol.
+func fetchRemoteRecordingIDs(cfg *config.Config) ([]int64, error) {
+	client := &http.Client{Timeout: 30 * time.Second}
+
+	// List files in the repo via HF API
+	apiURL := fmt.Sprintf("%s/api/datasets/%s/tree/main/data", cfg.HFBaseURL, cfg.HFRepo)
+	req, err := http.NewRequest("GET", apiURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+cfg.HFToken)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("HF API request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 404 {
+		// Repo or data/ dir doesn't exist yet
+		return nil, nil
+	}
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("HF API returned %d", resp.StatusCode)
+	}
+
+	var files []struct {
+		RfileName string `json:"rfilename"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&files); err != nil {
+		return nil, fmt.Errorf("failed to parse HF file listing: %w", err)
+	}
+
+	var parquetFiles []string
+	for _, f := range files {
+		if strings.HasSuffix(f.RfileName, ".parquet") {
+			parquetFiles = append(parquetFiles, f.RfileName)
+		}
+	}
+
+	if len(parquetFiles) == 0 {
+		return nil, nil
+	}
+
+	// Read recording_ids from each parquet via authenticated HTTPS URL
+	var allIDs []int64
+	for _, pf := range parquetFiles {
+		fileURL := fmt.Sprintf("%s/datasets/%s/resolve/main/data/%s", cfg.HFBaseURL, cfg.HFRepo, pf)
+		ids, err := readRecordingIDsFromURL(client, cfg.HFToken, fileURL)
+		if err != nil {
+			slog.Warn("failed to read remote parquet for dedup", "file", pf, "error", err)
+			continue
+		}
+		allIDs = append(allIDs, ids...)
+	}
+
+	return allIDs, nil
+}
+
+func readRecordingIDsFromURL(client *http.Client, token, fileURL string) ([]int64, error) {
+	req, err := http.NewRequest("GET", fileURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("HTTP %d for %s", resp.StatusCode, fileURL)
+	}
+
+	// Write to temp file so DuckDB can read it
+	tmp, err := os.CreateTemp("", "vmc_dedup_*.parquet")
+	if err != nil {
+		return nil, err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+
+	if _, err := tmp.ReadFrom(resp.Body); err != nil {
+		tmp.Close()
+		return nil, err
+	}
+	tmp.Close()
+
+	// Use DuckDB to read just the recording_id column
+	// We open a fresh in-memory DuckDB for this to avoid lock issues
+	sqlDB, err := sql.Open("duckdb", "")
+	if err != nil {
+		return nil, err
+	}
+	defer sqlDB.Close()
+
+	rows, err := sqlDB.Query(fmt.Sprintf("SELECT recording_id FROM '%s'", strings.ReplaceAll(tmpPath, "'", "''")))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err == nil {
+			ids = append(ids, id)
+		}
+	}
+	return ids, nil
+}
+
+func createUploadedTable(db *sql.DB, ids []int64) error {
+	if _, err := db.Exec("CREATE TEMP TABLE uploaded (recording_id BIGINT)"); err != nil {
+		return err
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	// Insert in batches
+	batch := 500
+	for i := 0; i < len(ids); i += batch {
+		end := i + batch
+		if end > len(ids) {
+			end = len(ids)
+		}
+		var values []string
+		for _, id := range ids[i:end] {
+			values = append(values, fmt.Sprintf("(%d)", id))
+		}
+		q := fmt.Sprintf("INSERT INTO uploaded VALUES %s", strings.Join(values, ","))
+		if _, err := db.Exec(q); err != nil {
+			return err
+		}
+	}
 	return nil
 }
