@@ -1,7 +1,7 @@
 package cmd
 
 import (
-	"log/slog"
+	"github.com/jborkowski/vmc/internal/process"
 
 	"github.com/spf13/cobra"
 )
@@ -9,8 +9,8 @@ import (
 var processCmd = &cobra.Command{
 	Use:   "process",
 	Short: "Process detected voice memos",
-	Run: func(cmd *cobra.Command, args []string) {
-		slog.Info("process subcommand placeholder")
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return process.Run(duck.DB(), cfg)
 	},
 }
 
