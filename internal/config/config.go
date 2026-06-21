@@ -15,6 +15,7 @@ type Config struct {
 	SyncInterval       int    `toml:"sync_interval"`
 	LogLevel           string `toml:"log_level"`
 	ShardDir           string `toml:"shard_dir"`
+	ShardMaxRows       int    `toml:"shard_max_rows"`
 	KeepUploadedShards bool   `toml:"keep_uploaded_shards"`
 	HFBaseURL          string `toml:"hf_base_url"`
 	AppleDBPath        string `toml:"apple_db_path"`
@@ -28,6 +29,7 @@ func DefaultConfig() *Config {
 		SyncInterval:       3600,
 		LogLevel:           "info",
 		ShardDir:           "~/.local/share/vmc/shards",
+		ShardMaxRows:       10,
 		KeepUploadedShards: false,
 		HFBaseURL:          "https://huggingface.co",
 		AppleDBPath:        "",

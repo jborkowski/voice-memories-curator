@@ -140,13 +140,9 @@ func Run(db *sql.DB, cfg *config.Config) error {
 			}
 		}
 	}
-	nextShard := maxShard + 1
-	tempShardPath := filepath.Join(shardDir, fmt.Sprintf("shard_%04d_tmp.parquet", nextShard))
-	finalShardPath := filepath.Join(shardDir, fmt.Sprintf("shard_%04d.parquet", nextShard))
 
 	recordingsDir := filepath.Dir(appleDBPath)
 
-	// Build timestamp expression based on ZDATE column type
 	var dateExpr string
 	if colTypes["ZDATE"] == "TIMESTAMP" {
 		dateExpr = "CAST(strftime(ZDATE + INTERVAL '978307200 seconds', '%Y-%m-%dT%H:%M:%SZ') AS VARCHAR)"
@@ -154,46 +150,77 @@ func Run(db *sql.DB, cfg *config.Config) error {
 		dateExpr = "CAST(strftime(CAST(to_timestamp(CAST(ZDATE AS DOUBLE) + 978307200) AS TIMESTAMP), '%Y-%m-%dT%H:%M:%SZ') AS VARCHAR)"
 	}
 
-	copyQuery := fmt.Sprintf(`
-		COPY (
-			SELECT 
-				CAST(Z_PK AS BIGINT) AS recording_id,
-				CAST(NULL AS BLOB) AS audio,
-				CAST(NULL AS BLOB) AS audio_original,
-				CAST('%s/' || ZPATH AS VARCHAR) AS audio_path,
-				%s AS title,
-				%s AS created_at,
-				%s AS duration_seconds,
-				%s AS transcription,
-				%s AS latitude,
-				%s AS longitude,
-				%s AS place_name,
-				%s AS device,
-				%s AS folder
-			FROM apple.ZCLOUDRECORDING
-			WHERE Z_PK NOT IN (SELECT recording_id FROM uploaded)
-			  AND Z_PK NOT IN (SELECT recording_id FROM local_pending)
-		) TO '%s' (FORMAT PARQUET)
-	`, strings.ReplaceAll(recordingsDir, "'", "''"), titleCol, dateExpr, durationCol, transcriptionCol, latCol, lonCol, placeCol, deviceCol, folderCol, tempShardPath)
-
-	var rowsWritten int64
-	if err := db.QueryRow(copyQuery).Scan(&rowsWritten); err != nil {
-		return fmt.Errorf("failed to write shard: %w", err)
+	shardMaxRows := cfg.ShardMaxRows
+	if shardMaxRows <= 0 {
+		shardMaxRows = 10
 	}
 
-	if rowsWritten == 0 {
+	// Count how many new memos we have
+	var totalNew int64
+	countQuery := `SELECT COUNT(*) FROM apple.ZCLOUDRECORDING
+		WHERE Z_PK NOT IN (SELECT recording_id FROM uploaded)
+		  AND Z_PK NOT IN (SELECT recording_id FROM local_pending)`
+	if err := db.QueryRow(countQuery).Scan(&totalNew); err != nil {
+		return fmt.Errorf("failed to count new memos: %w", err)
+	}
+
+	if totalNew == 0 {
 		slog.Info("no new memos detected")
-		os.Remove(tempShardPath)
 		return nil
 	}
 
-	if err := os.Rename(tempShardPath, finalShardPath); err != nil {
-		return fmt.Errorf("failed to rename temp shard: %w", err)
+	// Write shards in batches of shardMaxRows
+	var totalWritten int64
+	for offset := int64(0); offset < totalNew; offset += int64(shardMaxRows) {
+		maxShard++
+		tempShardPath := filepath.Join(shardDir, fmt.Sprintf("shard_%04d_tmp.parquet", maxShard))
+		finalShardPath := filepath.Join(shardDir, fmt.Sprintf("shard_%04d.parquet", maxShard))
+
+		copyQuery := fmt.Sprintf(`
+			COPY (
+				SELECT 
+					CAST(Z_PK AS BIGINT) AS recording_id,
+					CAST(NULL AS BLOB) AS audio,
+					CAST(NULL AS BLOB) AS audio_original,
+					CAST('%s/' || ZPATH AS VARCHAR) AS audio_path,
+					%s AS title,
+					%s AS created_at,
+					%s AS duration_seconds,
+					%s AS transcription,
+					%s AS latitude,
+					%s AS longitude,
+					%s AS place_name,
+					%s AS device,
+					%s AS folder
+				FROM apple.ZCLOUDRECORDING
+				WHERE Z_PK NOT IN (SELECT recording_id FROM uploaded)
+				  AND Z_PK NOT IN (SELECT recording_id FROM local_pending)
+				ORDER BY Z_PK
+				LIMIT %d OFFSET %d
+			) TO '%s' (FORMAT PARQUET)
+		`, strings.ReplaceAll(recordingsDir, "'", "''"), titleCol, dateExpr, durationCol, transcriptionCol, latCol, lonCol, placeCol, deviceCol, folderCol, shardMaxRows, offset, tempShardPath)
+
+		var rowsWritten int64
+		if err := db.QueryRow(copyQuery).Scan(&rowsWritten); err != nil {
+			return fmt.Errorf("failed to write shard %d: %w", maxShard, err)
+		}
+
+		if rowsWritten == 0 {
+			os.Remove(tempShardPath)
+			break
+		}
+
+		if err := os.Rename(tempShardPath, finalShardPath); err != nil {
+			return fmt.Errorf("failed to rename temp shard: %w", err)
+		}
+
+		totalWritten += rowsWritten
+		slog.Info("wrote shard", "shard", finalShardPath, "rows", rowsWritten)
 	}
 
 	slog.Info("detect phase complete",
-		slog.Int64("memos_found", rowsWritten),
-		slog.String("shard", finalShardPath),
+		slog.Int64("memos_found", totalWritten),
+		slog.Int("shard_count", maxShard),
 		slog.String("dedup_mode", dedupMode),
 	)
 
