@@ -48,6 +48,8 @@ func Run(db *sql.DB, cfg *config.Config) error {
 		}
 	}
 
+	db.Exec("SET http_max_scan_size = 0")
+
 	hfQuery := fmt.Sprintf("SELECT recording_id FROM 'hf://datasets/%s/data/*.parquet'", cfg.HFRepo)
 	if _, err := db.Exec(fmt.Sprintf("CREATE TEMP TABLE uploaded AS %s", hfQuery)); err != nil {
 		slog.Warn("HF query failed, falling back to local-only dedup", "error", err)
