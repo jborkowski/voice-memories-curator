@@ -37,7 +37,7 @@ func Run(db *sql.DB, cfg *config.Config) error {
 	}
 
 	attachQuery := fmt.Sprintf("ATTACH '%s' AS apple (TYPE sqlite, READ_ONLY);", strings.ReplaceAll(appleDBPath, "'", "''"))
-	if err := attachWithRetry(db, attachQuery, 3); err != nil {
+	if err := attachWithRetry(db, attachQuery, 5); err != nil {
 		return fmt.Errorf("failed to attach Voice Memos database: %w", err)
 	}
 	defer db.Exec("DETACH apple;")
@@ -239,6 +239,14 @@ func attachWithRetry(db *sql.DB, query string, maxAttempts int) error {
 		if _, err := db.Exec(query); err != nil {
 			lastErr = err
 			slog.Warn("sqlite ATTACH failed, retrying", "attempt", i+1, "error", err)
+			time.Sleep(time.Duration(i+1) * 500 * time.Millisecond)
+			continue
+		}
+		// Force DuckDB to actually open the file by querying it
+		if _, err := db.Exec("SELECT 1 FROM apple.ZCLOUDRECORDING LIMIT 1"); err != nil {
+			lastErr = err
+			db.Exec("DETACH apple;")
+			slog.Warn("sqlite file not accessible yet, retrying", "attempt", i+1, "error", err)
 			time.Sleep(time.Duration(i+1) * 500 * time.Millisecond)
 			continue
 		}
