@@ -159,6 +159,7 @@ func Run(db *sql.DB, cfg *config.Config) error {
 			SELECT 
 				CAST(Z_PK AS BIGINT) AS recording_id,
 				CAST(NULL AS BLOB) AS audio,
+				CAST(NULL AS BLOB) AS audio_original,
 				CAST('%s/' || ZPATH AS VARCHAR) AS audio_path,
 				%s AS title,
 				%s AS created_at,

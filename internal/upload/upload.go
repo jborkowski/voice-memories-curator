@@ -130,6 +130,7 @@ func uploadShard(db *sql.DB, cfg *config.Config, shardPath string) error {
 			SELECT 
 				recording_id,
 				{'bytes': audio, 'path': 'recording_' || CAST(recording_id AS VARCHAR) || '.flac'} AS audio,
+				{'bytes': audio_original, 'path': 'recording_' || CAST(recording_id AS VARCHAR) || '.m4a'} AS audio_original,
 				title, created_at, duration_seconds,
 				transcription, latitude, longitude, place_name, device, folder
 			FROM '%s'
@@ -174,6 +175,8 @@ dataset_info:
     - name: recording_id
       dtype: int64
     - name: audio
+      dtype: audio
+    - name: audio_original
       dtype: audio
     - name: title
       dtype: string

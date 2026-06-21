@@ -127,6 +127,7 @@ func TestProcessCrashResume(t *testing.T) {
 			SELECT 
 				recording_id,
 				CASE WHEN recording_id = 1 THEN CAST('mockaudio' AS BLOB) ELSE audio END AS audio,
+				audio_original,
 				audio_path, title, created_at, duration_seconds,
 				transcription, latitude, longitude,
 				place_name, device, folder
