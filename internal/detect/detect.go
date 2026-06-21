@@ -26,7 +26,7 @@ func Run(db *sql.DB, cfg *config.Config) error {
 		appleDBPath = filepath.Join(homeDir, "Library", "Application Support", "com.apple.voicememos", "Recordings", "CloudRecordings.db")
 	}
 	if _, err := os.Stat(appleDBPath); os.IsNotExist(err) || os.IsPermission(err) {
-		return fmt.Errorf("cannot open Voice Memos database — is Full Disk Access enabled for this terminal? Path: %s", appleDBPath)
+		return fmt.Errorf("cannot open Voice Memos database — grant Full Disk Access to vmc. Path: %s", appleDBPath)
 	}
 
 	shardDir := cfg.ShardDir
@@ -37,20 +37,8 @@ func Run(db *sql.DB, cfg *config.Config) error {
 		return fmt.Errorf("failed to create shard directory: %w", err)
 	}
 
-	attachQuery := fmt.Sprintf("ATTACH '%s' AS apple (TYPE sqlite, READ_ONLY);", strings.ReplaceAll(appleDBPath, "'", "''"))
-	if err := attachWithRetry(db, attachQuery, 5); err != nil {
-		// DuckDB sqlite extension can't open the file (likely locked by iCloud/VoiceMemos).
-		// Fall back to copying the DB to a temp file and reading the copy.
-		slog.Warn("direct ATTACH failed, copying DB to temp file", "error", err)
-		tmpCopy, copyErr := copyDBToTemp(appleDBPath)
-		if copyErr != nil {
-			return fmt.Errorf("failed to attach Voice Memos database (direct and copy both failed): direct=%w, copy=%v", err, copyErr)
-		}
-		defer os.Remove(tmpCopy)
-		attachCopy := fmt.Sprintf("ATTACH '%s' AS apple (TYPE sqlite, READ_ONLY);", strings.ReplaceAll(tmpCopy, "'", "''"))
-		if _, attachErr := db.Exec(attachCopy); attachErr != nil {
-			return fmt.Errorf("failed to attach copied Voice Memos database: %w", attachErr)
-		}
+	if err := attachAppleDB(db, appleDBPath); err != nil {
+		return err
 	}
 	defer db.Exec("DETACH apple;")
 	defer db.Exec("DROP TABLE IF EXISTS uploaded")
@@ -65,7 +53,7 @@ func Run(db *sql.DB, cfg *config.Config) error {
 			db.Exec("CREATE TEMP TABLE uploaded (recording_id BIGINT)")
 		} else {
 			if err := createUploadedTable(db, ids); err != nil {
-				slog.Warn("failed to create uploaded table from HF data", "error", err)
+				slog.Warn("failed to populate uploaded table", "error", err)
 				db.Exec("CREATE TEMP TABLE uploaded (recording_id BIGINT)")
 				dedupMode = "local-only"
 			}
@@ -245,56 +233,51 @@ func Run(db *sql.DB, cfg *config.Config) error {
 	return nil
 }
 
-func attachWithRetry(db *sql.DB, query string, maxAttempts int) error {
-	var lastErr error
-	for i := 0; i < maxAttempts; i++ {
-		if _, err := db.Exec(query); err != nil {
-			lastErr = err
-			slog.Warn("sqlite ATTACH failed, retrying", "attempt", i+1, "error", err)
-			time.Sleep(time.Duration(i+1) * 500 * time.Millisecond)
-			continue
-		}
-		// Force DuckDB to actually open the file by querying it
-		if _, err := db.Exec("SELECT 1 FROM apple.ZCLOUDRECORDING LIMIT 1"); err != nil {
-			lastErr = err
-			db.Exec("DETACH apple;")
-			slog.Warn("sqlite file not accessible yet, retrying", "attempt", i+1, "error", err)
-			time.Sleep(time.Duration(i+1) * 500 * time.Millisecond)
-			continue
-		}
-		return nil
-	}
-	return lastErr
-}
+// attachAppleDB tries direct ATTACH first, falls back to copying the DB file
+// (handles iCloud/VoiceMemos WAL locks and macOS TCC restrictions).
+func attachAppleDB(db *sql.DB, path string) error {
+	attachQuery := fmt.Sprintf("ATTACH '%s' AS apple (TYPE sqlite, READ_ONLY);", strings.ReplaceAll(path, "'", "''"))
 
-func copyDBToTemp(srcPath string) (string, error) {
-	src, err := os.Open(srcPath)
+	for i := range 3 {
+		if _, err := db.Exec(attachQuery); err == nil {
+			if _, err := db.Exec("SELECT 1 FROM apple.ZCLOUDRECORDING LIMIT 1"); err == nil {
+				return nil
+			}
+			db.Exec("DETACH apple;")
+		}
+		time.Sleep(time.Duration(i+1) * 500 * time.Millisecond)
+	}
+
+	// Direct access failed — copy DB to temp and attach copy
+	src, err := os.Open(path)
 	if err != nil {
-		return "", err
+		return fmt.Errorf("Voice Memos DB not accessible — grant Full Disk Access to vmc: %w", err)
 	}
 	defer src.Close()
 
 	tmp, err := os.CreateTemp("", "vmc_voicememos_*.db")
 	if err != nil {
-		return "", err
+		return fmt.Errorf("failed to create temp copy: %w", err)
 	}
-
 	if _, err := io.Copy(tmp, src); err != nil {
 		tmp.Close()
 		os.Remove(tmp.Name())
-		return "", err
+		return fmt.Errorf("failed to copy Voice Memos DB: %w", err)
 	}
 	tmp.Close()
-	return tmp.Name(), nil
+
+	attachCopy := fmt.Sprintf("ATTACH '%s' AS apple (TYPE sqlite, READ_ONLY);", strings.ReplaceAll(tmp.Name(), "'", "''"))
+	if _, err := db.Exec(attachCopy); err != nil {
+		os.Remove(tmp.Name())
+		return fmt.Errorf("failed to attach copied Voice Memos DB: %w", err)
+	}
+	// tmp file cleaned up by caller via defer os.Remove after DETACH
+	return nil
 }
 
-// fetchRemoteRecordingIDs uses the HuggingFace API to list parquet files in the
-// dataset repo, then reads recording_ids from each via DuckDB over HTTPS with
-// Bearer auth — no reliance on DuckDB's broken hf:// protocol.
 func fetchRemoteRecordingIDs(cfg *config.Config) ([]int64, error) {
 	client := &http.Client{Timeout: 30 * time.Second}
 
-	// List files in the repo via HF API
 	apiURL := fmt.Sprintf("%s/api/datasets/%s/tree/main/data", cfg.HFBaseURL, cfg.HFRepo)
 	req, err := http.NewRequest("GET", apiURL, nil)
 	if err != nil {
@@ -309,7 +292,6 @@ func fetchRemoteRecordingIDs(cfg *config.Config) ([]int64, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode == 404 {
-		// Repo or data/ dir doesn't exist yet
 		return nil, nil
 	}
 	if resp.StatusCode != 200 {
@@ -323,24 +305,15 @@ func fetchRemoteRecordingIDs(cfg *config.Config) ([]int64, error) {
 		return nil, fmt.Errorf("failed to parse HF file listing: %w", err)
 	}
 
-	var parquetFiles []string
-	for _, f := range files {
-		if strings.HasSuffix(f.RfileName, ".parquet") {
-			parquetFiles = append(parquetFiles, f.RfileName)
-		}
-	}
-
-	if len(parquetFiles) == 0 {
-		return nil, nil
-	}
-
-	// Read recording_ids from each parquet via authenticated HTTPS URL
 	var allIDs []int64
-	for _, pf := range parquetFiles {
-		fileURL := fmt.Sprintf("%s/datasets/%s/resolve/main/data/%s", cfg.HFBaseURL, cfg.HFRepo, pf)
-		ids, err := readRecordingIDsFromURL(client, cfg.HFToken, fileURL)
+	for _, f := range files {
+		if !strings.HasSuffix(f.RfileName, ".parquet") {
+			continue
+		}
+		fileURL := fmt.Sprintf("%s/datasets/%s/resolve/main/data/%s", cfg.HFBaseURL, cfg.HFRepo, f.RfileName)
+		ids, err := readRecordingIDs(client, cfg.HFToken, fileURL)
 		if err != nil {
-			slog.Warn("failed to read remote parquet for dedup", "file", pf, "error", err)
+			slog.Warn("failed to read remote parquet for dedup", "file", f.RfileName, "error", err)
 			continue
 		}
 		allIDs = append(allIDs, ids...)
@@ -349,7 +322,7 @@ func fetchRemoteRecordingIDs(cfg *config.Config) ([]int64, error) {
 	return allIDs, nil
 }
 
-func readRecordingIDsFromURL(client *http.Client, token, fileURL string) ([]int64, error) {
+func readRecordingIDs(client *http.Client, token, fileURL string) ([]int64, error) {
 	req, err := http.NewRequest("GET", fileURL, nil)
 	if err != nil {
 		return nil, err
@@ -363,10 +336,9 @@ func readRecordingIDsFromURL(client *http.Client, token, fileURL string) ([]int6
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("HTTP %d for %s", resp.StatusCode, fileURL)
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 
-	// Write to temp file so DuckDB can read it
 	tmp, err := os.CreateTemp("", "vmc_dedup_*.parquet")
 	if err != nil {
 		return nil, err
@@ -374,14 +346,12 @@ func readRecordingIDsFromURL(client *http.Client, token, fileURL string) ([]int6
 	tmpPath := tmp.Name()
 	defer os.Remove(tmpPath)
 
-	if _, err := tmp.ReadFrom(resp.Body); err != nil {
+	if _, err := io.Copy(tmp, resp.Body); err != nil {
 		tmp.Close()
 		return nil, err
 	}
 	tmp.Close()
 
-	// Use DuckDB to read just the recording_id column
-	// We open a fresh in-memory DuckDB for this to avoid lock issues
 	sqlDB, err := sql.Open("duckdb", "")
 	if err != nil {
 		return nil, err
@@ -411,19 +381,13 @@ func createUploadedTable(db *sql.DB, ids []int64) error {
 	if len(ids) == 0 {
 		return nil
 	}
-	// Insert in batches
-	batch := 500
-	for i := 0; i < len(ids); i += batch {
-		end := i + batch
-		if end > len(ids) {
-			end = len(ids)
-		}
+	for i := 0; i < len(ids); i += 500 {
+		end := min(i+500, len(ids))
 		var values []string
 		for _, id := range ids[i:end] {
 			values = append(values, fmt.Sprintf("(%d)", id))
 		}
-		q := fmt.Sprintf("INSERT INTO uploaded VALUES %s", strings.Join(values, ","))
-		if _, err := db.Exec(q); err != nil {
+		if _, err := db.Exec(fmt.Sprintf("INSERT INTO uploaded VALUES %s", strings.Join(values, ","))); err != nil {
 			return err
 		}
 	}
