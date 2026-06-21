@@ -84,6 +84,52 @@ func TestDetectIdempotent(t *testing.T) {
 	}
 }
 
+func TestDetectMultiShard(t *testing.T) {
+	testutil.SuppressLogs()
+
+	var rows []testutil.AppleDBRow
+	for i := 1; i <= 25; i++ {
+		rows = append(rows, testutil.AppleDBRow{
+			Z_PK: i, ZDATE: float64(i * 1000), ZPATH: "2023/x.m4a", ZCUSTOMLABEL: "Memo", ZDURATION: 1.0,
+		})
+	}
+	dbPath := testutil.CreateAppleDB(t, rows)
+	shardDir := t.TempDir()
+	cfg := testutil.SetupConfig(t, "https://example.com", dbPath, shardDir)
+	cfg.ShardMaxRows = 10
+
+	db := testutil.GetDuckDB(t)
+
+	if err := Run(db, cfg); err != nil {
+		t.Fatalf("detect Run failed: %v", err)
+	}
+
+	shard1 := filepath.Join(shardDir, "shard_0001.parquet")
+	shard2 := filepath.Join(shardDir, "shard_0002.parquet")
+	shard3 := filepath.Join(shardDir, "shard_0003.parquet")
+
+	var c1, c2, c3 int
+	if err := db.QueryRow("SELECT COUNT(*) FROM '" + shard1 + "'").Scan(&c1); err != nil {
+		t.Fatalf("failed to read shard1: %v", err)
+	}
+	if err := db.QueryRow("SELECT COUNT(*) FROM '" + shard2 + "'").Scan(&c2); err != nil {
+		t.Fatalf("failed to read shard2: %v", err)
+	}
+	if err := db.QueryRow("SELECT COUNT(*) FROM '" + shard3 + "'").Scan(&c3); err != nil {
+		t.Fatalf("failed to read shard3: %v", err)
+	}
+
+	if c1 != 10 {
+		t.Errorf("shard1: expected 10 rows, got %d", c1)
+	}
+	if c2 != 10 {
+		t.Errorf("shard2: expected 10 rows, got %d", c2)
+	}
+	if c3 != 5 {
+		t.Errorf("shard3: expected 5 rows, got %d", c3)
+	}
+}
+
 func TestDetectOfflineDedup(t *testing.T) {
 	testutil.SuppressLogs()
 
