@@ -220,7 +220,7 @@ func processShard(db *sql.DB, shardPath string) (int, int, error) {
 				%s AS transcription, s.latitude, s.longitude,
 				s.place_name, s.device, s.folder
 			FROM '%s' s
-		) TO '%s' (FORMAT PARQUET)
+		) TO '%s' (FORMAT PARQUET, ROW_GROUP_SIZE 1)
 	`, audioExpr.String(), origCol, txCol, strings.ReplaceAll(shardPath, "'", "''"), strings.ReplaceAll(tempShardPath, "'", "''"))
 
 	if _, err := db.Exec(copyQuery); err != nil {

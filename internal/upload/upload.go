@@ -134,7 +134,7 @@ func uploadShard(db *sql.DB, cfg *config.Config, shardPath string) error {
 				title, created_at, duration_seconds,
 				transcription, latitude, longitude, place_name, device, folder
 			FROM '%s'
-		) TO '%s' (FORMAT PARQUET)
+		) TO '%s' (FORMAT PARQUET, ROW_GROUP_SIZE 1)
 	`, strings.ReplaceAll(shardPath, "'", "''"), strings.ReplaceAll(tempPath, "'", "''"))
 
 	if _, err := db.Exec(copyQuery); err != nil {

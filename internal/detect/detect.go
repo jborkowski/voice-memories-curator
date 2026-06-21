@@ -197,7 +197,7 @@ func Run(db *sql.DB, cfg *config.Config) error {
 				  AND Z_PK NOT IN (SELECT recording_id FROM local_pending)
 				ORDER BY Z_PK
 				LIMIT %d OFFSET %d
-			) TO '%s' (FORMAT PARQUET)
+			) TO '%s' (FORMAT PARQUET, ROW_GROUP_SIZE 1)
 		`, strings.ReplaceAll(recordingsDir, "'", "''"), titleCol, dateExpr, durationCol, transcriptionCol, latCol, lonCol, placeCol, deviceCol, folderCol, shardMaxRows, offset, tempShardPath)
 
 		var rowsWritten int64
