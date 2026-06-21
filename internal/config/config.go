@@ -16,6 +16,8 @@ type Config struct {
 	LogLevel           string `toml:"log_level"`
 	ShardDir           string `toml:"shard_dir"`
 	KeepUploadedShards bool   `toml:"keep_uploaded_shards"`
+	HFBaseURL          string `toml:"hf_base_url"`
+	AppleDBPath        string `toml:"apple_db_path"`
 }
 
 func DefaultConfig() *Config {
@@ -27,6 +29,8 @@ func DefaultConfig() *Config {
 		LogLevel:           "info",
 		ShardDir:           "~/.local/share/vmc/shards",
 		KeepUploadedShards: false,
+		HFBaseURL:          "https://huggingface.co",
+		AppleDBPath:        "",
 	}
 }
 

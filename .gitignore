@@ -14,3 +14,5 @@ __pycache__/
 *.swo
 *~
 vmc
+test.sqlite
+testdata/sample.m4a

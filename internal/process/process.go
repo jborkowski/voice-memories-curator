@@ -153,7 +153,7 @@ func processShard(db *sql.DB, shardPath string) (int, int, error) {
 	var audioExpr strings.Builder
 	audioExpr.WriteString("CASE\n")
 	for id, flacPath := range flacPaths {
-		audioExpr.WriteString(fmt.Sprintf("WHEN s.recording_id = %d THEN read_blob('%s')\n", id, strings.ReplaceAll(flacPath, "'", "''")))
+		audioExpr.WriteString(fmt.Sprintf("WHEN s.recording_id = %d THEN (SELECT content FROM read_blob('%s'))\n", id, strings.ReplaceAll(flacPath, "'", "''")))
 	}
 	audioExpr.WriteString("ELSE s.audio END AS audio")
 

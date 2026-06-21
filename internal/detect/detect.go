@@ -17,7 +17,10 @@ func Run(db *sql.DB, cfg *config.Config) error {
 		return fmt.Errorf("failed to get home directory: %w", err)
 	}
 
-	appleDBPath := filepath.Join(homeDir, "Library", "Application Support", "com.apple.voicememos", "Recordings", "CloudRecordings.db")
+	appleDBPath := cfg.AppleDBPath
+	if appleDBPath == "" {
+		appleDBPath = filepath.Join(homeDir, "Library", "Application Support", "com.apple.voicememos", "Recordings", "CloudRecordings.db")
+	}
 	if _, err := os.Stat(appleDBPath); os.IsNotExist(err) || os.IsPermission(err) {
 		return fmt.Errorf("cannot open Voice Memos database — is Full Disk Access enabled for this terminal? Path: %s", appleDBPath)
 	}
@@ -35,6 +38,8 @@ func Run(db *sql.DB, cfg *config.Config) error {
 		return fmt.Errorf("failed to attach Voice Memos database: %w", err)
 	}
 	defer db.Exec("DETACH apple;")
+	defer db.Exec("DROP TABLE IF EXISTS uploaded")
+	defer db.Exec("DROP TABLE IF EXISTS local_pending")
 
 	dedupMode := "local+hf"
 	if cfg.HFToken != "" {
@@ -61,20 +66,15 @@ func Run(db *sql.DB, cfg *config.Config) error {
 		db.Exec("CREATE TEMP TABLE local_pending (recording_id BIGINT)")
 	}
 
-	// Fetch columns to dynamically select only what exists
-	rows, err := db.Query("PRAGMA apple.table_info('ZCLOUDRECORDING')")
+	rows, err := db.Query("SELECT column_name FROM information_schema.columns WHERE table_name = 'ZCLOUDRECORDING'")
 	if err != nil {
 		return fmt.Errorf("failed to inspect ZCLOUDRECORDING schema: %w", err)
 	}
 
 	cols := make(map[string]bool)
 	for rows.Next() {
-		var cid int
-		var name, typeStr string
-		var notNull int
-		var dfltValue interface{}
-		var pk int
-		if err := rows.Scan(&cid, &name, &typeStr, &notNull, &dfltValue, &pk); err == nil {
+		var name string
+		if err := rows.Scan(&name); err == nil {
 			cols[strings.ToUpper(name)] = true
 		}
 	}
@@ -142,7 +142,7 @@ func Run(db *sql.DB, cfg *config.Config) error {
 	tempShardPath := filepath.Join(shardDir, fmt.Sprintf("shard_%04d_tmp.parquet", nextShard))
 	finalShardPath := filepath.Join(shardDir, fmt.Sprintf("shard_%04d.parquet", nextShard))
 
-	recordingsDir := filepath.Join(homeDir, "Library", "Application Support", "com.apple.voicememos", "Recordings")
+	recordingsDir := filepath.Dir(appleDBPath)
 
 	copyQuery := fmt.Sprintf(`
 		COPY (
@@ -151,7 +151,7 @@ func Run(db *sql.DB, cfg *config.Config) error {
 				CAST(NULL AS BLOB) AS audio,
 				CAST('%s/' || ZPATH AS VARCHAR) AS audio_path,
 				%s AS title,
-				CAST(strftime(to_timestamp(ZDATE + 978307200), '%%Y-%%m-%%dT%%H:%%M:%%SZ') AS VARCHAR) AS created_at,
+				CAST(strftime(CAST(to_timestamp(ZDATE + 978307200) AS TIMESTAMP), '%%Y-%%m-%%dT%%H:%%M:%%SZ') AS VARCHAR) AS created_at,
 				%s AS duration_seconds,
 				%s AS transcription,
 				%s AS latitude,

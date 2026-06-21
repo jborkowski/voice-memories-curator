@@ -66,7 +66,7 @@ func Run(db *sql.DB, cfg *config.Config) error {
 	}
 
 	// 2. Connectivity check
-	if err := checkConnectivity(); err != nil {
+	if err := checkConnectivity(cfg); err != nil {
 		slog.Info(fmt.Sprintf("offline, %d shards ready", len(readyShards)))
 		return nil
 	}
@@ -94,9 +94,9 @@ func Run(db *sql.DB, cfg *config.Config) error {
 	return nil
 }
 
-func checkConnectivity() error {
+func checkConnectivity(cfg *config.Config) error {
 	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Head("https://huggingface.co")
+	resp, err := client.Head(cfg.HFBaseURL)
 	if err != nil {
 		return err
 	}
@@ -157,7 +157,7 @@ func uploadShard(db *sql.DB, cfg *config.Config, shardPath string) error {
 		return fmt.Errorf("failed to read temp parquet file: %w", err)
 	}
 
-	url := fmt.Sprintf("https://huggingface.co/api/datasets/%s/upload/main/%s", cfg.HFRepo, pathInRepo)
+	url := fmt.Sprintf("%s/api/datasets/%s/upload/main/%s", cfg.HFBaseURL, cfg.HFRepo, pathInRepo)
 	
 	req, err := http.NewRequest("POST", url, bytes.NewReader(fileData))
 	if err != nil {
@@ -202,7 +202,7 @@ func uploadShard(db *sql.DB, cfg *config.Config, shardPath string) error {
 }
 
 func createRepo(cfg *config.Config) error {
-	url := "https://huggingface.co/api/repos/create"
+	url := fmt.Sprintf("%s/api/repos/create", cfg.HFBaseURL)
 	
 	// The HFRepo should be "username/repo_name". We need the repo_name part.
 	parts := strings.Split(cfg.HFRepo, "/")
