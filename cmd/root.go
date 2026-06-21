@@ -10,6 +10,7 @@ import (
 
 	"github.com/jborkowski/vmc/internal/config"
 	"github.com/jborkowski/vmc/internal/db"
+	"github.com/jborkowski/vmc/internal/logging"
 )
 
 var (
@@ -28,7 +29,7 @@ var rootCmd = &cobra.Command{
 		}
 
 		initConfig()
-		initLogger()
+		initLogger(cmd.Name())
 		return initDB()
 	},
 	PersistentPostRunE: func(cmd *cobra.Command, args []string) error {
@@ -53,7 +54,7 @@ func initConfig() {
 	}
 }
 
-func initLogger() {
+func initLogger(cmdName string) {
 	level := slog.LevelInfo
 	switch strings.ToLower(cfg.LogLevel) {
 	case "debug":
@@ -64,9 +65,23 @@ func initLogger() {
 		level = slog.LevelError
 	}
 
-	handler := slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+	opts := &slog.HandlerOptions{
 		Level: level,
-	})
+	}
+
+	var handler slog.Handler
+	if cmdName == "daemon" {
+		rw, err := logging.NewRotatingWriter()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to create rotating logger, falling back to stdout: %v\n", err)
+			handler = slog.NewJSONHandler(os.Stdout, opts)
+		} else {
+			handler = slog.NewJSONHandler(rw, opts)
+		}
+	} else {
+		handler = slog.NewJSONHandler(os.Stdout, opts)
+	}
+
 	slog.SetDefault(slog.New(handler))
 }
 
