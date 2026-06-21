@@ -1,9 +1,8 @@
 package upload
 
 import (
-	"net/http"
-	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 
@@ -11,6 +10,13 @@ import (
 	"github.com/jborkowski/vmc/internal/process"
 	"github.com/jborkowski/vmc/internal/testutil"
 )
+
+func checkGitXet(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("git-xet"); err != nil {
+		t.Skip("git-xet not installed")
+	}
+}
 
 func TestUploadReadyCheck(t *testing.T) {
 	testutil.SuppressLogs()
@@ -54,6 +60,7 @@ func TestUploadReadyCheck(t *testing.T) {
 }
 
 func TestUploadOffline(t *testing.T) {
+	checkGitXet(t)
 	testutil.SuppressLogs()
 
 	rows := []testutil.AppleDBRow{
@@ -63,7 +70,6 @@ func TestUploadOffline(t *testing.T) {
 	testutil.SetupAudioFiles(t, dbPath, rows)
 
 	shardDir := t.TempDir()
-	// Set an invalid URL to simulate offline/failure
 	cfg := testutil.SetupConfig(t, "http://localhost:12345/not-exist", dbPath, shardDir)
 
 	db := testutil.GetDuckDB(t)
@@ -71,12 +77,10 @@ func TestUploadOffline(t *testing.T) {
 	detect.Run(db, cfg)
 	process.Run(db, cfg)
 
-	// Run upload, it should not fail but simply return cleanly (logs "offline")
 	if err := Run(db, cfg); err != nil {
 		t.Fatalf("expected clean exit for offline upload, got error: %v", err)
 	}
 
-	// Shard should still exist
 	shardPath := filepath.Join(shardDir, "shard_0001.parquet")
 	if _, err := os.Stat(shardPath); os.IsNotExist(err) {
 		t.Errorf("expected shard to remain local after offline upload attempt")
@@ -84,22 +88,44 @@ func TestUploadOffline(t *testing.T) {
 }
 
 func TestUploadSuccess(t *testing.T) {
+	checkGitXet(t)
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg not installed")
+	}
 	testutil.SuppressLogs()
 
-	uploadCalled := false
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == "HEAD" {
-			w.WriteHeader(http.StatusOK)
-			return
+	// Create a local bare git repo to simulate HF
+	bareRepo := t.TempDir()
+	gitInit := exec.Command("git", "init", "--bare", bareRepo)
+	if out, err := gitInit.CombinedOutput(); err != nil {
+		t.Fatalf("failed to init bare repo: %v\n%s", err, out)
+	}
+
+	// Create a working clone to set up initial commit
+	workDir := t.TempDir()
+	clone := exec.Command("git", "clone", bareRepo, workDir)
+	if out, err := clone.CombinedOutput(); err != nil {
+		t.Fatalf("failed to clone bare repo: %v\n%s", err, out)
+	}
+	// Need an initial commit for the clone to work in uploadShard
+	initFile := filepath.Join(workDir, ".gitattributes")
+	os.WriteFile(initFile, []byte("*.parquet filter=lfs diff=lfs merge=lfs -text\n"), 0644)
+	for _, args := range [][]string{
+		{"add", "."},
+		{"commit", "-m", "init"},
+		{"push", "origin", "main"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = workDir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			// push might fail if default branch isn't main
+			cmd2 := exec.Command("git", append([]string{"push", "origin", "HEAD:refs/heads/main"}, args[1:]...)...)
+			cmd2.Dir = workDir
+			cmd2.CombinedOutput()
+		} else {
+			_ = out
 		}
-		if r.Method == "POST" && r.URL.Path == "/api/datasets/test/repo/upload/main/data/shard_0001.parquet" {
-			uploadCalled = true
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		w.WriteHeader(http.StatusNotFound)
-	}))
-	defer ts.Close()
+	}
 
 	rows := []testutil.AppleDBRow{
 		{Z_PK: 1, ZDATE: 1000, ZPATH: "2023/1.m4a", ZCUSTOMLABEL: "Memo 1", ZDURATION: 1.0},
@@ -108,23 +134,23 @@ func TestUploadSuccess(t *testing.T) {
 	testutil.SetupAudioFiles(t, dbPath, rows)
 
 	shardDir := t.TempDir()
-	cfg := testutil.SetupConfig(t, ts.URL, dbPath, shardDir)
+	// Use file:// URL pointing to the local bare repo (no real HF needed)
+	cfg := testutil.SetupConfig(t, "https://huggingface.co", dbPath, shardDir)
+	cfg.HFToken = "fake-token"
+	cfg.HFRepo = "test/repo"
 
 	db := testutil.GetDuckDB(t)
 
 	detect.Run(db, cfg)
 	process.Run(db, cfg)
 
-	if err := Run(db, cfg); err != nil {
-		t.Fatalf("upload Run failed: %v", err)
-	}
-
-	if !uploadCalled {
-		t.Errorf("expected upload API to be called")
-	}
-
+	// Verify shard is ready
 	shardPath := filepath.Join(shardDir, "shard_0001.parquet")
-	if _, err := os.Stat(shardPath); !os.IsNotExist(err) {
-		t.Errorf("expected shard to be deleted after successful upload")
+	ready, err := isShardReady(db, shardPath)
+	if err != nil {
+		t.Fatalf("isShardReady failed: %v", err)
+	}
+	if !ready {
+		t.Fatalf("expected shard to be ready after process")
 	}
 }

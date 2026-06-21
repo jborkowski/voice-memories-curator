@@ -4,10 +4,10 @@ import (
 	"bytes"
 	"database/sql"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -18,6 +18,10 @@ import (
 func Run(db *sql.DB, cfg *config.Config) error {
 	if cfg.HFToken == "" {
 		return fmt.Errorf("HFToken is required for upload. Set HF_TOKEN environment variable or hf_token in config.toml")
+	}
+
+	if _, err := exec.LookPath("git-xet"); err != nil {
+		return fmt.Errorf("git-xet not found — install it with: brew install git-xet && git xet install")
 	}
 
 	homeDir, err := os.UserHomeDir()
@@ -43,7 +47,6 @@ func Run(db *sql.DB, cfg *config.Config) error {
 
 	var readyShards []string
 
-	// 1. Find ready shards (all rows have audio IS NOT NULL)
 	for _, shardPath := range matches {
 		if strings.HasSuffix(shardPath, "_tmp.parquet") {
 			continue
@@ -65,7 +68,6 @@ func Run(db *sql.DB, cfg *config.Config) error {
 		return nil
 	}
 
-	// 2. Connectivity check
 	if err := checkConnectivity(cfg); err != nil {
 		slog.Info(fmt.Sprintf("offline, %d shards ready", len(readyShards)))
 		return nil
@@ -73,15 +75,12 @@ func Run(db *sql.DB, cfg *config.Config) error {
 
 	slog.Info(fmt.Sprintf("%d shards ready for upload", len(readyShards)))
 
-	// 3. Upload ready shards
 	for _, shardPath := range readyShards {
 		if err := uploadShard(db, cfg, shardPath); err != nil {
 			slog.Error("failed to upload shard", "shard", shardPath, "error", err)
-			// Partial failure: shard stays local for retry
 			continue
 		}
 
-		// 5. Delete local shard on success (unless keep_uploaded_shards)
 		if !cfg.KeepUploadedShards {
 			if err := os.Remove(shardPath); err != nil {
 				slog.Error("failed to delete uploaded shard", "shard", shardPath, "error", err)
@@ -117,7 +116,7 @@ func isShardReady(db *sql.DB, shardPath string) (bool, error) {
 }
 
 func uploadShard(db *sql.DB, cfg *config.Config, shardPath string) error {
-	// 3. Column-select for HF schema — drop internal fields like audio_path
+	// Export shard with HF-destined columns only (drop audio_path)
 	tempFile, err := os.CreateTemp("", "vmc_upload_*.parquet")
 	if err != nil {
 		return fmt.Errorf("failed to create temp file: %w", err)
@@ -130,16 +129,9 @@ func uploadShard(db *sql.DB, cfg *config.Config, shardPath string) error {
 		COPY (
 			SELECT 
 				recording_id,
-				audio,
-				title,
-				created_at,
-				duration_seconds,
-				transcription,
-				latitude,
-				longitude,
-				place_name,
-				device,
-				folder
+				{'bytes': audio, 'path': 'recording_' || CAST(recording_id AS VARCHAR) || '.flac'} AS audio,
+				title, created_at, duration_seconds,
+				transcription, latitude, longitude, place_name, device, folder
 			FROM '%s'
 		) TO '%s' (FORMAT PARQUET)
 	`, strings.ReplaceAll(shardPath, "'", "''"), strings.ReplaceAll(tempPath, "'", "''"))
@@ -148,63 +140,121 @@ func uploadShard(db *sql.DB, cfg *config.Config, shardPath string) error {
 		return fmt.Errorf("failed to extract HF schema: %w", err)
 	}
 
-	// 4. Push as data/shard_NNNN.parquet to the HF dataset repo
+	// Clone the dataset repo into a temp dir (shallow)
+	repoDir, err := os.MkdirTemp("", "vmc_repo_*")
+	if err != nil {
+		return fmt.Errorf("failed to create temp repo dir: %w", err)
+	}
+	defer os.RemoveAll(repoDir)
+
+	repoURL := fmt.Sprintf("https://x-access-token:%s@huggingface.co/datasets/%s", cfg.HFToken, cfg.HFRepo)
+
+	if err := gitCmd(repoDir, "clone", "--depth=1", repoURL, "."); err != nil {
+		// Repo might not exist yet — try creating it
+		if createErr := createRepo(cfg); createErr != nil {
+			return fmt.Errorf("clone failed and repo creation failed: clone=%w, create=%v", err, createErr)
+		}
+		if err := gitCmd(repoDir, "clone", "--depth=1", repoURL, "."); err != nil {
+			return fmt.Errorf("clone failed after repo creation: %w", err)
+		}
+	}
+
+	// Ensure data/ directory exists
+	dataDir := filepath.Join(repoDir, "data")
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		return fmt.Errorf("failed to create data dir: %w", err)
+	}
+
+	// Ensure dataset card exists with audio feature metadata
+	readmePath := filepath.Join(repoDir, "README.md")
+	if _, err := os.Stat(readmePath); os.IsNotExist(err) {
+		card := `---
+dataset_info:
+  features:
+    - name: recording_id
+      dtype: int64
+    - name: audio
+      dtype: audio
+    - name: title
+      dtype: string
+    - name: created_at
+      dtype: string
+    - name: duration_seconds
+      dtype: float64
+    - name: transcription
+      dtype: string
+    - name: latitude
+      dtype: float64
+    - name: longitude
+      dtype: float64
+    - name: place_name
+      dtype: string
+    - name: device
+      dtype: string
+    - name: folder
+      dtype: string
+license: other
+---
+# Voice Memories
+
+Private dataset of Apple Voice Memos, transcoded to FLAC 16kHz mono.
+`
+		os.WriteFile(readmePath, []byte(card), 0644)
+		gitCmd(repoDir, "add", "README.md")
+	}
+
+	// Copy the exported parquet into data/
 	fileName := filepath.Base(shardPath)
-	pathInRepo := fmt.Sprintf("data/%s", fileName)
-
-	fileData, err := os.ReadFile(tempPath)
+	destPath := filepath.Join(dataDir, fileName)
+	data, err := os.ReadFile(tempPath)
 	if err != nil {
-		return fmt.Errorf("failed to read temp parquet file: %w", err)
+		return fmt.Errorf("failed to read exported parquet: %w", err)
+	}
+	if err := os.WriteFile(destPath, data, 0644); err != nil {
+		return fmt.Errorf("failed to write parquet to repo: %w", err)
 	}
 
-	url := fmt.Sprintf("%s/api/datasets/%s/upload/main/%s", cfg.HFBaseURL, cfg.HFRepo, pathInRepo)
-	
-	req, err := http.NewRequest("POST", url, bytes.NewReader(fileData))
-	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
+	// git add + commit + push
+	if err := gitCmd(repoDir, "add", "data/"+fileName); err != nil {
+		return fmt.Errorf("git add failed: %w", err)
 	}
 
-	req.Header.Set("Authorization", "Bearer "+cfg.HFToken)
-	req.Header.Set("Content-Type", "application/octet-stream")
-
-	client := &http.Client{Timeout: 10 * time.Minute}
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("HTTP request failed: %w", err)
+	if err := gitCmd(repoDir, "add", "-A"); err != nil {
+		// non-fatal, README might not have been created
 	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusNotFound {
-		// Try creating the repo first
-		if err := createRepo(cfg); err != nil {
-			return fmt.Errorf("repo not found and failed to create: %w", err)
+	if err := gitCmd(repoDir, "commit", "-m", fmt.Sprintf("Upload %s", fileName)); err != nil {
+		// "nothing to commit" means file already exists with same content — success
+		if strings.Contains(err.Error(), "nothing to commit") || strings.Contains(err.Error(), "no changes added") {
+			slog.Info("shard already exists on HF with same content", "shard", shardPath)
+			return nil
 		}
-		// Retry upload
-		req, _ = http.NewRequest("POST", url, bytes.NewReader(fileData))
-		req.Header.Set("Authorization", "Bearer "+cfg.HFToken)
-		req.Header.Set("Content-Type", "application/octet-stream")
-		resp2, err := client.Do(req)
-		if err != nil {
-			return fmt.Errorf("HTTP request failed on retry: %w", err)
-		}
-		defer resp2.Body.Close()
-		if resp2.StatusCode < 200 || resp2.StatusCode >= 300 {
-			body, _ := io.ReadAll(resp2.Body)
-			return fmt.Errorf("upload failed on retry with status %d: %s", resp2.StatusCode, string(body))
-		}
-	} else if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("upload failed with status %d: %s", resp.StatusCode, string(body))
+		return fmt.Errorf("git commit failed: %w", err)
 	}
 
-	slog.Info("successfully uploaded shard to HF", "shard", shardPath, "repo", cfg.HFRepo, "path", pathInRepo)
+	if err := gitCmd(repoDir, "push"); err != nil {
+		return fmt.Errorf("git push failed: %w", err)
+	}
+
+	slog.Info("successfully uploaded shard to HF", "shard", shardPath, "repo", cfg.HFRepo, "path", "data/"+fileName)
+	return nil
+}
+
+func gitCmd(dir string, args ...string) error {
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("%s: %s", err, output.String())
+	}
 	return nil
 }
 
 func createRepo(cfg *config.Config) error {
 	url := fmt.Sprintf("%s/api/repos/create", cfg.HFBaseURL)
-	
-	// The HFRepo should be "username/repo_name". We need the repo_name part.
+
 	parts := strings.Split(cfg.HFRepo, "/")
 	repoName := cfg.HFRepo
 	if len(parts) == 2 {
@@ -212,27 +262,26 @@ func createRepo(cfg *config.Config) error {
 	}
 
 	payload := fmt.Sprintf(`{"type": "dataset", "name": "%s", "private": %v}`, repoName, cfg.HFPrivate)
-	
+
 	req, err := http.NewRequest("POST", url, strings.NewReader(payload))
 	if err != nil {
 		return err
 	}
-	
+
 	req.Header.Set("Authorization", "Bearer "+cfg.HFToken)
 	req.Header.Set("Content-Type", "application/json")
-	
+
 	client := &http.Client{Timeout: 30 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-	
+
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("status %d: %s", resp.StatusCode, string(body))
+		return fmt.Errorf("status %d", resp.StatusCode)
 	}
-	
+
 	slog.Info("created new HF dataset repo", "repo", cfg.HFRepo)
 	return nil
 }

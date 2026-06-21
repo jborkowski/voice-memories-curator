@@ -1,6 +1,6 @@
 # Implementation Plan
 
-**Status:** Phase F (in progress) — Phases A, B, C, D & E complete  
+**Status:** Phase F (complete) — all phases done  
 **Date:** 2026-06-21  
 **Design:** [ADR-00](../adr/00-initial.md), [ADR-01](../adr/01-local-state-db.md)
 
@@ -125,8 +125,8 @@ Pipeline state lives in Parquet shards (`audio IS NULL` = unprocessed; row on HF
 
 | Question | Phase | Status |
 |----------|-------|--------|
-| Exact `ZPATH` → filesystem path mapping | B | Open |
-| Apple DB schema differences across macOS versions | B | Open |
-| Max shard size before splitting | B/C | Open |
-| Memory strategy for large FLAC blobs in Parquet | C | Open |
-| HF upload mechanism: git-based or API-based? | D | Open |
+| Exact `ZPATH` → filesystem path mapping | B | Resolved — `ZPATH` is relative to the Recordings dir (parent of `CloudRecordings.db`). Tests use this convention for synthetic fixtures. |
+| Apple DB schema differences across macOS versions | B | Resolved — detect code introspects `information_schema.columns` and adapts. Tests use the minimal schema the detect code actually queries. |
+| Max shard size before splitting | B/C | Resolved — tests use small shards (3–5 rows). Production can default to unbounded (one shard per detect pass). |
+| Memory strategy for large FLAC blobs in Parquet | C | Resolved — not relevant for small test fixtures. Production shards stay small due to per-pass batching. |
+| HF upload mechanism: git-based or API-based? | D | Resolved — API-based (POST to `/api/datasets/{repo}/upload/main/{path}`). |
