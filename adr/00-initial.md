@@ -8,38 +8,95 @@
 
 ## Architecture Overview
 
+Three decoupled phases, each runs independently:
+
 ```mermaid
-graph TD
-    LaunchD[launchd] -->|periodic trigger| Daemon[vmc daemon]
-    Daemon --> DBReader[SQLite Reader]
-    DBReader --> VoiceMemosDB["CloudRecordings.db"]
-    Daemon --> StateStore[Local State DB]
-    Daemon --> Publisher[HF Publisher]
-    Publisher -->|private dataset| HFHub[Hugging Face Hub]
-    CLI[vmc cli] -->|unix socket / file| StateStore
-    Daemon --> LogFile[os_log / file log]
+graph LR
+    subgraph phase1 [Phase 1: Detect]
+        AppleDB["Apple VoiceMemos.db"] --> Detect[detect new memos]
+        Detect --> LocalParquet["local shard parquet (metadata only)"]
+    end
+    subgraph phase2 [Phase 2: Process]
+        LocalParquet --> Process[ffmpeg transcode]
+        M4A[".m4a files"] --> Process
+        Process --> LocalParquet
+    end
+    subgraph phase3 [Phase 3: Upload]
+        LocalParquet --> Upload[push to HF]
+        Upload --> HFHub[HF Hub dataset]
+    end
 ```
+
+## Design Principles
+
+1. **Three independent phases** — detect, process, upload. Each does one job. They don't depend on each other running in the same pass.
+2. **HF is the permanent store** — once uploaded, local shards can be cleaned.
+3. **Self-contained dataset** — Parquet shards on HF embed FLAC audio blobs. Download the dataset, get everything.
+4. **Incremental** — each sync appends a new shard to the HF repo.
+5. **Lazy** — if offline, detect still works. Processing still works. Only upload waits.
+
+## The Three Phases
+
+### Phase 1: Detect
+
+Find new/modified memos in Apple's DB. Append metadata rows to local Parquet shard. No audio processing.
+
+- Attach Apple's SQLite via DuckDB
+- Query Apple DB against existing local shards + HF remote to find what's new/changed
+- Write metadata-only rows to the current local shard (recording_id, title, timestamps, location, transcription, audio_path reference)
+- Runs regardless of connectivity (offline: skip HF query, check local shards only)
+
+### Phase 2: Process
+
+Fill the audio column for detected entries that don't have it yet.
+
+- Read local shard, find rows where audio blob is NULL
+- For each: invoke `ffmpeg` to transcode `.m4a` → FLAC 16kHz mono
+- Write FLAC bytes into the shard's audio column
+- Runs regardless of connectivity
+
+### Phase 3: Upload
+
+Push fully processed shards to HF.
+
+- Check connectivity
+- If offline: exit
+- If online: find shards where all rows have non-NULL audio
+- Commit shard to HF dataset repo as `data/shard_NNNN.parquet`
+- On success: optionally delete local shard
 
 ## Components
 
 ### 1. Single Go Binary (`vmc`)
 
-One binary, two modes:
-- `vmc daemon` — long-running sync loop (launched by launchd)
-- `vmc status` / `vmc logs` / `vmc sync-now` — CLI subcommands that query daemon state
+One binary, subcommands:
+- `vmc daemon` — runs all three phases in sequence (launched by launchd)
+- `vmc detect` — run phase 1 only
+- `vmc process` — run phase 2 only
+- `vmc upload` — run phase 3 only
+- `vmc status` / `vmc logs` — query pipeline state from shards
+- `vmc install` / `vmc uninstall` — launchd management
 
-### 2. Data Source: macOS Voice Memos SQLite
+### 2. DuckDB Engine
+
+Single dependency:
+- Attaches Apple's SQLite read-only (`sqlite_scanner`)
+- Reads/writes local Parquet shards (native Parquet support)
+- Queries HF remote Parquet when online (for dedup in phase 1)
+
+Requires CGO (`github.com/marcboeker/go-duckdb`). Binary ~80MB.
+
+### 3. Data Source: macOS Voice Memos
 
 - Path: `~/Library/Application Support/com.apple.voicememos/Recordings/CloudRecordings.db`
-- Read-only access (open with `SQLITE_OPEN_READONLY`)
-- Tables: `ZCLOUDRECORDING` (metadata), audio files on disk as `.m4a`
+- Attached read-only: `ATTACH '...' AS apple (TYPE sqlite, READ_ONLY);`
 - Requires **Full Disk Access** TCC permission
 
-### 3. Metadata Collected Per Memory
+### 4. Metadata Collected Per Memory
 
 | Field | Source |
 |-------|--------|
-| audio (m4a bytes) | filesystem path from `ZPATH` |
+| audio | FLAC 16kHz mono blob (filled in phase 2) |
 | title | `ZCUSTOMLABEL` / `ZENCRYPTEDTITLE` |
 | created_at | `ZDATE` (Apple epoch → RFC3339) |
 | duration_seconds | `ZDURATION` |
@@ -50,113 +107,111 @@ One binary, two modes:
 | folder | Voice Memos folder/group |
 | recording_id | unique stable ID for dedup |
 
-### 4. Deduplication Strategy
+### 5. Local Shard Lifecycle
 
-- Local state DB (SQLite, `~/.local/share/vmc/state.db`) tracks:
-  - `recording_id` (primary key from Voice Memos DB)
-  - `content_hash` (SHA-256 of audio file)
-  - `synced_at` timestamp
-  - `hf_commit` (commit SHA on HF when pushed)
-- On each run: query Voice Memos DB, diff against state DB, only process new/modified entries
-- Deleted memos: optionally mark as tombstoned in state, never delete from HF dataset
+```
+[phase 1] create shard, metadata only, audio column = NULL
+[phase 2] fill audio column with FLAC blob
+[phase 3] upload to HF, then optionally delete local copy
+```
 
-### 5. HF Publishing
-
-- Use HF Hub HTTP API directly from Go (no Python dependency)
-- Dataset visibility controlled via config (default: `private`)
-- Push strategy: append-only Parquet shards (one shard per sync batch)
-- Each shard is a standalone Parquet file with the schema above
-- Repo name configurable via config
+Shards live at `~/.local/share/vmc/shards/shard_NNNN.parquet`.
 
 ### 6. Configuration
 
-- Config file at `~/.config/vmc/config.toml`
-- All settings in one place:
+Config file at `~/.config/vmc/config.toml`:
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `hf_token` | `""` (falls back to `~/.cache/huggingface/token` or `HF_TOKEN` env) | HF API token |
-| `hf_repo` | `voice-memories` | Dataset repo name on HF Hub |
-| `hf_private` | `true` | Dataset visibility (private by default) |
-| `sync_interval` | `3600` | Seconds between syncs (used in launchd plist) |
+| `hf_token` | `""` (falls back to HF cache / env) | HF API token |
+| `hf_repo` | `voice-memories` | Dataset repo name |
+| `hf_private` | `true` | Dataset visibility |
+| `sync_interval` | `3600` | Seconds between runs |
 | `log_level` | `info` | Logging verbosity |
-| `state_dir` | `~/.local/share/vmc` | Where state.db and staged shards live |
+| `shard_dir` | `~/.local/share/vmc` | Local shards directory |
+| `keep_uploaded_shards` | `false` | Delete local shards after upload |
 
-### 6. Offline Resilience
+### 7. Offline Behavior
 
-- Before any network call: probe connectivity (HEAD request to `huggingface.co`)
-- If offline: extract and stage locally, mark as `pending_upload` in state DB
-- Next online run: batch-upload all pending entries
-- Never block, never retry indefinitely — log and exit cleanly
+| Phase | Offline? | Behavior |
+|-------|----------|----------|
+| Detect | works | reads local Apple DB; skips HF query, checks local shards only |
+| Process | works | reads local .m4a files, no network needed |
+| Upload | skips | logs "offline, N shards ready", exits |
 
-### 7. launchd Integration
+Heavy local files (shards with audio) only exist between phase 2 and phase 3. Once uploaded, they're gone (if `keep_uploaded_shards = false`).
+
+### 8. launchd Integration
 
 - Plist at `~/Library/LaunchAgents/com.vmc.daemon.plist`
-- `StartInterval`: configurable (default 3600s = hourly)
-- `StandardOutPath` / `StandardErrorPath` → `~/Library/Logs/vmc/`
-- `KeepAlive: false` (run-and-exit per interval, not persistent)
-- Binary installed at `/usr/local/bin/vmc`
+- `StartInterval`: from config (default 3600s)
+- `KeepAlive: false` (run all phases, exit)
+- Binary at `/usr/local/bin/vmc`
 
-### 8. Logging
+### 9. Logging
 
 - Structured JSON logs to `~/Library/Logs/vmc/vmc.log`
-- Log rotation: by size (10MB) with 5 kept
+- Rotation: 10MB, 5 kept
 - Levels: `info`, `warn`, `error`
-- CLI `vmc logs` tails the log file with optional `--follow`
 
-### 9. CLI Subcommands
+### 10. CLI Subcommands
 
 | Command | Action |
 |---------|--------|
-| `vmc status` | show last sync time, pending count, online/offline, dataset URL |
-| `vmc sync-now` | trigger immediate sync (same logic as daemon run) |
-| `vmc logs` | tail log output |
-| `vmc install` | write launchd plist + load agent |
-| `vmc uninstall` | unload agent + remove plist |
+| `vmc status` | last run, pending/processed counts from shards, online status, dataset URL |
+| `vmc daemon` | run detect → process → upload in sequence |
+| `vmc detect` | phase 1 only |
+| `vmc process` | phase 2 only |
+| `vmc upload` | phase 3 only |
+| `vmc sync-now` | alias for `vmc daemon` |
+| `vmc logs` | tail logs |
+| `vmc install` | write + load launchd plist |
+| `vmc uninstall` | unload + remove plist |
 
-### 10. Go Dependencies (minimal)
+### 11. Go Dependencies
 
-- `modernc.org/sqlite` — pure-Go SQLite (no CGO, single binary)
-- `parquet-go` — Parquet file writing
-- Standard library for HTTP (HF API), JSON, crypto/sha256
-- No frameworks for CLI — just `flag` or a thin wrapper
+- `github.com/marcboeker/go-duckdb` — DuckDB (CGO)
+- Standard library: `net/http`, `os/exec`, `crypto/sha256`, `encoding/json`
+- Runtime dependency: `ffmpeg` (declared in Homebrew formula, pulled automatically)
 
-## Data Flow Per Sync Cycle
+## Data Flow
 
 ```mermaid
 sequenceDiagram
     participant LD as launchd
-    participant D as vmc daemon
-    participant VM as VoiceMemos.db
-    participant S as state.db
-    participant FS as Audio Files
-    participant HF as HF Hub API
+    participant D as vmc
+    participant DDB as DuckDB
+    participant FF as ffmpeg
+    participant HF as HF Hub
 
-    LD->>D: start (interval)
-    D->>VM: read ZCLOUDRECORDING
-    D->>S: load known recording_ids
-    D->>D: diff → new entries
-    D->>FS: read .m4a for new entries
-    D->>D: hash, build parquet shard
+    LD->>D: start
+
+    Note over D: Phase 1 - Detect
+    D->>DDB: ATTACH Apple SQLite
+    D->>DDB: query Apple vs local shards + HF → new memos
+    D->>DDB: write metadata rows to shard (audio=NULL)
+
+    Note over D: Phase 2 - Process
+    D->>DDB: find shard rows where audio IS NULL
+    loop each unprocessed memo
+        D->>FF: .m4a → FLAC 16kHz mono
+        D->>DDB: update shard row with FLAC blob
+    end
+
+    Note over D: Phase 3 - Upload
     D->>D: check connectivity
     alt online
-        D->>HF: upload shard (private dataset)
-        D->>S: mark synced + hf_commit
+        D->>DDB: read shards where all rows have audio
+        D->>HF: commit shard to data/
+        D->>D: delete local shard
     else offline
-        D->>S: mark pending_upload
+        D->>D: log "N shards ready", exit
     end
-    D->>D: log summary, exit 0
 ```
-
-## Security / Privacy Notes
-
-- Dataset hardcoded to **private** — no flag to make public
-- HF token stored in standard HF location (user's responsibility)
-- No audio data cached outside state DB + HF — staged parquet in temp dir, cleaned after upload
-- Full Disk Access required — user grants once via System Settings
 
 ## Build / Distribution
 
-- Single `go build` produces static binary
-- No CGO (pure-Go SQLite) — trivially cross-compilable but only targets `darwin/arm64`
-- Homebrew tap or direct download
+- `CGO_ENABLED=1 go build` — target `darwin/arm64` only
+- Binary ~80MB (DuckDB embedded)
+- Pre-built binary via GitHub releases or Homebrew tap
+- Homebrew formula declares `depends_on "ffmpeg"` — installed automatically as a package dependency
