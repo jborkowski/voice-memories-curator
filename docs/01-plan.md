@@ -1,6 +1,6 @@
 # Implementation Plan
 
-**Status:** Phase C (in progress) — Phases A & B complete  
+**Status:** Phase D (in progress) — Phases A, B & C complete  
 **Date:** 2026-06-21  
 **Design:** [ADR-00](../adr/00-initial.md), [ADR-01](../adr/01-local-state-db.md)
 
