@@ -88,11 +88,11 @@ func Run(db *sql.DB, cfg *config.Config) error {
 
 	titleCol := "CAST(NULL AS VARCHAR)"
 	if cols["ZCUSTOMLABEL"] && cols["ZENCRYPTEDTITLE"] {
-		titleCol = "COALESCE(CAST(ZCUSTOMLABEL AS VARCHAR), CAST(ZENCRYPTEDTITLE AS VARCHAR))"
-	} else if cols["ZCUSTOMLABEL"] {
-		titleCol = "CAST(ZCUSTOMLABEL AS VARCHAR)"
+		titleCol = "COALESCE(CAST(ZENCRYPTEDTITLE AS VARCHAR), CAST(ZCUSTOMLABEL AS VARCHAR))"
 	} else if cols["ZENCRYPTEDTITLE"] {
 		titleCol = "CAST(ZENCRYPTEDTITLE AS VARCHAR)"
+	} else if cols["ZCUSTOMLABEL"] {
+		titleCol = "CAST(ZCUSTOMLABEL AS VARCHAR)"
 	}
 
 	transcriptionCol := "CAST(NULL AS VARCHAR)"
