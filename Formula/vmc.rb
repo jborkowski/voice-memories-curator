@@ -10,6 +10,7 @@ class Vmc < Formula
   depends_on "git-xet"
 
   def install
+    ENV["CGO_ENABLED"] = "1"
     system "go", "build", *std_go_args(ldflags: "-s -w"), "."
   end
 
