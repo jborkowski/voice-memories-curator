@@ -75,7 +75,6 @@ One binary, subcommands:
 - `vmc process` — run phase 2 only
 - `vmc upload` — run phase 3 only
 - `vmc status` / `vmc logs` — query pipeline state from shards
-- `vmc install` / `vmc uninstall` — launchd management
 
 ### 2. DuckDB Engine
 
@@ -141,12 +140,21 @@ Config file at `~/.config/vmc/config.toml`:
 
 Heavy local files (shards with audio) only exist between phase 2 and phase 3. Once uploaded, they're gone (if `keep_uploaded_shards = false`).
 
-### 8. launchd Integration
+### 8. Scheduling (Homebrew Services)
 
-- Plist at `~/Library/LaunchAgents/com.vmc.daemon.plist`
-- `StartInterval`: from config (default 3600s)
-- `KeepAlive: false` (run all phases, exit)
-- Binary at `/usr/local/bin/vmc`
+Distributed via a personal Homebrew tap. The formula ships a launchd plist; scheduling is managed with `brew services`:
+
+```bash
+brew install <tap>/vmc
+brew services start vmc    # enable periodic runs
+brew services stop vmc     # disable
+brew services restart vmc  # after config changes
+```
+
+- Plist installed by Homebrew at `~/Library/LaunchAgents/homebrew.mxcl.vmc.plist`
+- `StartInterval`: 3600s (matches `sync_interval` default)
+- `KeepAlive: false` — each wake runs `vmc daemon` (all three phases), then exits
+- Binary on `PATH` via Homebrew (`$(brew --prefix)/bin/vmc`)
 
 ### 9. Logging
 
@@ -165,8 +173,6 @@ Heavy local files (shards with audio) only exist between phase 2 and phase 3. On
 | `vmc upload` | phase 3 only |
 | `vmc sync-now` | alias for `vmc daemon` |
 | `vmc logs` | tail logs |
-| `vmc install` | write + load launchd plist |
-| `vmc uninstall` | unload + remove plist |
 
 ### 11. Go Dependencies
 
@@ -213,5 +219,6 @@ sequenceDiagram
 
 - `CGO_ENABLED=1 go build` — target `darwin/arm64` only
 - Binary ~80MB (DuckDB embedded)
-- Pre-built binary via GitHub releases or Homebrew tap
-- Homebrew formula declares `depends_on "ffmpeg"` — installed automatically as a package dependency
+- Personal Homebrew tap — sole distribution path
+- Formula declares `depends_on "ffmpeg"` and a `service` block for launchd
+- Install: `brew install <tap>/vmc && brew services start vmc`
