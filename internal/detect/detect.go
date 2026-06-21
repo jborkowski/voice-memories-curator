@@ -2,14 +2,36 @@ package detect
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/jborkowski/vmc/internal/config"
 )
+
+const debugLogPath = "/Users/jonatan/sources/voice-momories-curator/.cursor/debug-a0a063.log"
+
+func debugLog(hypothesisID, location, message string, data map[string]interface{}) {
+	entry := map[string]interface{}{
+		"sessionId":    "a0a063",
+		"hypothesisId": hypothesisID,
+		"location":     location,
+		"message":      message,
+		"data":         data,
+		"timestamp":    time.Now().UnixMilli(),
+	}
+	b, _ := json.Marshal(entry)
+	f, err := os.OpenFile(debugLogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	f.Write(append(b, '\n'))
+	f.Close()
+}
 
 func Run(db *sql.DB, cfg *config.Config) error {
 	homeDir, err := os.UserHomeDir()
@@ -34,29 +56,60 @@ func Run(db *sql.DB, cfg *config.Config) error {
 	}
 
 	attachQuery := fmt.Sprintf("ATTACH '%s' AS apple (TYPE sqlite, READ_ONLY);", strings.ReplaceAll(appleDBPath, "'", "''"))
+	// #region agent log
+	debugLog("C", "detect.go:attach", "attempting sqlite ATTACH", map[string]interface{}{"path": appleDBPath})
+	// #endregion
 	if _, err := db.Exec(attachQuery); err != nil {
+		// #region agent log
+		debugLog("C", "detect.go:attach_fail", "ATTACH failed", map[string]interface{}{"error": err.Error()})
+		// #endregion
 		return fmt.Errorf("failed to attach Voice Memos database: %w", err)
 	}
+	// #region agent log
+	debugLog("C", "detect.go:attach_ok", "ATTACH succeeded", nil)
+	// #endregion
 	defer db.Exec("DETACH apple;")
 	defer db.Exec("DROP TABLE IF EXISTS uploaded")
 	defer db.Exec("DROP TABLE IF EXISTS local_pending")
 
 	dedupMode := "local+hf"
 	if cfg.HFToken != "" {
-		db.Exec("DROP SECRET IF EXISTS hf_secret")
-		if _, err := db.Exec(fmt.Sprintf("CREATE SECRET hf_secret (TYPE HUGGINGFACE, TOKEN '%s');", cfg.HFToken)); err != nil {
-			slog.Warn("Failed to set HF token via secret, trying bearer token", "error", err)
-			db.Exec(fmt.Sprintf("SET VARIABLE hf_token = '%s';", cfg.HFToken))
+		// #region agent log
+		debugLog("A", "detect.go:secret", "creating HF secret", map[string]interface{}{"token_len": len(cfg.HFToken)})
+		// #endregion
+		if _, err := db.Exec(fmt.Sprintf("CREATE OR REPLACE SECRET hf_secret (TYPE HUGGINGFACE, TOKEN '%s');", cfg.HFToken)); err != nil {
+			// #region agent log
+			debugLog("A", "detect.go:secret_fail", "HF secret creation failed", map[string]interface{}{"error": err.Error()})
+			// #endregion
+			slog.Warn("Failed to set HF token", "error", err)
+		} else {
+			// #region agent log
+			debugLog("A", "detect.go:secret_ok", "HF secret created successfully", nil)
+			// #endregion
 		}
+	} else {
+		// #region agent log
+		debugLog("B", "detect.go:no_token", "HFToken is empty", nil)
+		// #endregion
 	}
 
 	db.Exec("SET http_max_scan_size = 0")
 
+	// #region agent log
+	debugLog("E", "detect.go:hf_query", "about to run hf:// query", map[string]interface{}{"repo": cfg.HFRepo})
+	// #endregion
 	hfQuery := fmt.Sprintf("SELECT recording_id FROM 'hf://datasets/%s/data/*.parquet'", cfg.HFRepo)
 	if _, err := db.Exec(fmt.Sprintf("CREATE TEMP TABLE uploaded AS %s", hfQuery)); err != nil {
+		// #region agent log
+		debugLog("E", "detect.go:hf_query_fail", "hf:// query failed", map[string]interface{}{"error": err.Error()})
+		// #endregion
 		slog.Warn("HF query failed, falling back to local-only dedup", "error", err)
 		dedupMode = "local-only"
 		db.Exec("CREATE TEMP TABLE uploaded (recording_id BIGINT)")
+	} else {
+		// #region agent log
+		debugLog("E", "detect.go:hf_query_ok", "hf:// query succeeded", nil)
+		// #endregion
 	}
 
 	localShardsPattern := filepath.Join(shardDir, "*.parquet")
