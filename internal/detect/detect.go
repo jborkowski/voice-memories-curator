@@ -43,8 +43,10 @@ func Run(db *sql.DB, cfg *config.Config) error {
 
 	dedupMode := "local+hf"
 	if cfg.HFToken != "" {
-		if _, err := db.Exec(fmt.Sprintf("CREATE OR REPLACE SECRET hf_secret (TYPE HUGGINGFACE, TOKEN '%s');", cfg.HFToken)); err != nil {
-			slog.Warn("Failed to set HF token", "error", err)
+		db.Exec("DROP SECRET IF EXISTS hf_secret")
+		if _, err := db.Exec(fmt.Sprintf("CREATE SECRET hf_secret (TYPE HUGGINGFACE, TOKEN '%s');", cfg.HFToken)); err != nil {
+			slog.Warn("Failed to set HF token via secret, trying bearer token", "error", err)
+			db.Exec(fmt.Sprintf("SET VARIABLE hf_token = '%s';", cfg.HFToken))
 		}
 	}
 
