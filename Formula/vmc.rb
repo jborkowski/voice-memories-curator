@@ -17,10 +17,25 @@ class Vmc < Formula
   service do
     run [opt_bin/"vmc", "daemon"]
     working_dir HOMEBREW_PREFIX
+    environment_variables PATH: "#{HOMEBREW_PREFIX}/bin:#{HOMEBREW_PREFIX}/sbin:/usr/bin:/bin:/usr/sbin:/sbin",
+                          HOME: Dir.home
     log_path var/"log/vmc.log"
     error_log_path var/"log/vmc.log"
     run_type :interval
     interval 3600
+  end
+
+  def caveats
+    <<~EOS
+      To allow vmc to read Voice Memos, grant Full Disk Access to the binary:
+        System Settings → Privacy & Security → Full Disk Access → add #{opt_bin}/vmc
+
+      Configure your HF token in ~/.config/vmc/config.toml:
+        hf_token = "hf_YOUR_TOKEN"
+
+      Then start the service:
+        brew services start vmc
+    EOS
   end
 
   test do
