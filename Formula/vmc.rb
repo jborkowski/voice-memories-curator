@@ -7,6 +7,7 @@ class Vmc < Formula
   depends_on :macos
   depends_on "go" => :build
   depends_on "ffmpeg"
+  depends_on "git-xet"
 
   def install
     system "go", "build", *std_go_args(ldflags: "-s -w"), "."

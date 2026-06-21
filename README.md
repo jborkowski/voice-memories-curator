@@ -2,33 +2,37 @@
 
 A macOS daemon that periodically extracts macOS Voice Memos, transcodes audio to FLAC, and uploads Parquet shards to a private Hugging Face dataset.
 
-## Prerequisites
+## Installation
 
+### Homebrew (recommended)
+
+```bash
+brew tap jborkowski/vmc
+brew install vmc
+```
+
+This installs `vmc` and its dependency `ffmpeg` automatically.
+
+To run as a background service (syncs every hour):
+
+```bash
+brew services start vmc
+```
+
+### From source
+
+Prerequisites:
 - macOS Apple Silicon (darwin/arm64)
 - CGO enabled (required for DuckDB)
-- **Full Disk Access** for your terminal (see [Permissions](#permissions) below)
-
-## Building
+- Go 1.22+
+- ffmpeg
 
 ```bash
 make build
+make install   # installs to ~/.local/bin
 ```
 
-Other targets:
-
-```bash
-make run      # build + run
-make install  # build + install to ~/.local/bin
-make clean    # remove binary
-```
-
-## Installation
-
-```bash
-make install
-```
-
-This installs the `vmc` binary to `~/.local/bin/`. Make sure this directory is in your `$PATH`:
+Make sure `~/.local/bin` is in your `$PATH`:
 
 ```bash
 export PATH="$HOME/.local/bin:$PATH"
