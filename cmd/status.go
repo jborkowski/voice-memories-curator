@@ -37,7 +37,11 @@ var statusCmd = &cobra.Command{
 			}
 		}
 
-		hfURL := fmt.Sprintf("https://huggingface.co/datasets/%s", cfg.HFRepo)
+		base := strings.TrimRight(cfg.HFBaseURL, "/")
+		if base == "" {
+			base = "https://huggingface.co"
+		}
+		hfURL := fmt.Sprintf("%s/datasets/%s", base, cfg.HFRepo)
 
 		// Shards directory
 		shardDir := expandHome(cfg.ShardDir)

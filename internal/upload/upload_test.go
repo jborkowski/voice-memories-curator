@@ -77,7 +77,7 @@ func TestUploadOffline(t *testing.T) {
 	detect.Run(db, cfg)
 	process.Run(db, cfg)
 
-	if err := Run(db, cfg); err != nil {
+	if err := RunWithOptions(db, cfg, true); err != nil {
 		t.Fatalf("expected clean exit for offline upload, got error: %v", err)
 	}
 

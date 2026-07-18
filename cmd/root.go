@@ -23,17 +23,21 @@ var rootCmd = &cobra.Command{
 	Short: "Voice Memories Curator",
 	Long:  `vmc is a macOS daemon that extracts Voice Memos, transcodes them, and uploads them to Hugging Face.`,
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
-		// Do not initialize config and DB for help commands
-		if cmd.Name() == "help" {
+		if cmd.Name() == "help" || cmd.Name() == "completion" {
 			return nil
 		}
 
 		initConfig()
 		initLogger(cmd.Name())
+
+		// logs only needs config + logger; skip DuckDB to avoid lock contention.
+		if cmd.Name() == "logs" {
+			return nil
+		}
 		return initDB()
 	},
 	PersistentPostRunE: func(cmd *cobra.Command, args []string) error {
-		if cmd.Name() == "help" {
+		if cmd.Name() == "help" || cmd.Name() == "completion" || cmd.Name() == "logs" {
 			return nil
 		}
 		cleanup()

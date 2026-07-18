@@ -37,13 +37,12 @@ func Run(db *sql.DB, cfg *config.Config) error {
 		return fmt.Errorf("failed to create shard directory: %w", err)
 	}
 
-	if err := attachAppleDB(db, appleDBPath); err != nil {
-		return err
-	}
-	defer db.Exec("DETACH apple;")
 	defer db.Exec("DROP TABLE IF EXISTS uploaded")
 	defer db.Exec("DROP TABLE IF EXISTS local_pending")
+	defer db.Exec("DROP TABLE IF EXISTS apple_snapshot")
 
+	// Build dedup tables BEFORE touching Apple's DB so network I/O never
+	// overlaps with a live ATTACH on CloudRecordings.db.
 	dedupMode := "local+hf"
 	if cfg.HFToken != "" && cfg.HFRepo != "" {
 		ids, err := fetchRemoteRecordingIDs(cfg)
@@ -73,6 +72,114 @@ func Run(db *sql.DB, cfg *config.Config) error {
 	} else {
 		db.Exec("CREATE TEMP TABLE local_pending (recording_id BIGINT)")
 	}
+
+	recordingsDir := filepath.Dir(appleDBPath)
+
+	// Snapshot Apple DB (main + WAL/SHM), attach briefly, copy rows into DuckDB, DETACH.
+	if err := snapshotAndLoadApple(db, appleDBPath, recordingsDir); err != nil {
+		return err
+	}
+
+	maxShard := 0
+	for _, m := range matches {
+		name := filepath.Base(m)
+		var num int
+		if _, err := fmt.Sscanf(name, "shard_%d.parquet", &num); err == nil {
+			if num > maxShard {
+				maxShard = num
+			}
+		}
+	}
+
+	shardMaxRows := cfg.ShardMaxRows
+	if shardMaxRows <= 0 {
+		shardMaxRows = 10
+	}
+
+	var totalNew int64
+	countQuery := `SELECT COUNT(*) FROM apple_snapshot
+		WHERE recording_id NOT IN (SELECT recording_id FROM uploaded)
+		  AND recording_id NOT IN (SELECT recording_id FROM local_pending)`
+	if err := db.QueryRow(countQuery).Scan(&totalNew); err != nil {
+		return fmt.Errorf("failed to count new memos: %w", err)
+	}
+
+	if totalNew == 0 {
+		slog.Info("no new memos detected")
+		return nil
+	}
+
+	var totalWritten int64
+	for offset := int64(0); offset < totalNew; offset += int64(shardMaxRows) {
+		maxShard++
+		tempShardPath := filepath.Join(shardDir, fmt.Sprintf("shard_%04d_tmp.parquet", maxShard))
+		finalShardPath := filepath.Join(shardDir, fmt.Sprintf("shard_%04d.parquet", maxShard))
+
+		copyQuery := fmt.Sprintf(`
+			COPY (
+				SELECT
+					recording_id,
+					CAST(NULL AS BLOB) AS audio,
+					CAST(NULL AS BLOB) AS audio_original,
+					audio_path,
+					title,
+					created_at,
+					duration_seconds,
+					transcription,
+					latitude,
+					longitude,
+					place_name,
+					device,
+					folder
+				FROM apple_snapshot
+				WHERE recording_id NOT IN (SELECT recording_id FROM uploaded)
+				  AND recording_id NOT IN (SELECT recording_id FROM local_pending)
+				ORDER BY recording_id
+				LIMIT %d OFFSET %d
+			) TO '%s' (FORMAT PARQUET, ROW_GROUP_SIZE 1)
+		`, shardMaxRows, offset, strings.ReplaceAll(tempShardPath, "'", "''"))
+
+		var rowsWritten int64
+		if err := db.QueryRow(copyQuery).Scan(&rowsWritten); err != nil {
+			return fmt.Errorf("failed to write shard %d: %w", maxShard, err)
+		}
+
+		if rowsWritten == 0 {
+			os.Remove(tempShardPath)
+			break
+		}
+
+		if err := os.Rename(tempShardPath, finalShardPath); err != nil {
+			return fmt.Errorf("failed to rename temp shard: %w", err)
+		}
+
+		totalWritten += rowsWritten
+		slog.Info("wrote shard", "shard", finalShardPath, "rows", rowsWritten)
+	}
+
+	slog.Info("detect phase complete",
+		slog.Int64("memos_found", totalWritten),
+		slog.Int("shard_count", maxShard),
+		slog.String("dedup_mode", dedupMode),
+	)
+
+	return nil
+}
+
+// snapshotAndLoadApple copies CloudRecordings.db (+ WAL/SHM when present),
+// attaches the copy read-only just long enough to materialize apple_snapshot,
+// then detaches so the live Voice Memos DB is never held across later work.
+func snapshotAndLoadApple(db *sql.DB, appleDBPath, recordingsDir string) error {
+	snapPath, cleanup, err := snapshotAppleDB(appleDBPath)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	if err := attachApplePath(db, snapPath); err != nil {
+		return err
+	}
+	defer db.Exec("DETACH apple;")
 
 	rows, err := db.Query("SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'ZCLOUDRECORDING'")
 	if err != nil {
@@ -138,19 +245,6 @@ func Run(db *sql.DB, cfg *config.Config) error {
 		durationCol = "CAST(ZDURATION AS DOUBLE)"
 	}
 
-	maxShard := 0
-	for _, m := range matches {
-		name := filepath.Base(m)
-		var num int
-		if _, err := fmt.Sscanf(name, "shard_%d.parquet", &num); err == nil {
-			if num > maxShard {
-				maxShard = num
-			}
-		}
-	}
-
-	recordingsDir := filepath.Dir(appleDBPath)
-
 	var dateExpr string
 	if colTypes["ZDATE"] == "TIMESTAMP" {
 		dateExpr = "CAST(strftime(ZDATE + INTERVAL '978307200 seconds', '%Y-%m-%dT%H:%M:%SZ') AS VARCHAR)"
@@ -158,84 +252,95 @@ func Run(db *sql.DB, cfg *config.Config) error {
 		dateExpr = "CAST(strftime(CAST(to_timestamp(CAST(ZDATE AS DOUBLE) + 978307200) AS TIMESTAMP), '%Y-%m-%dT%H:%M:%SZ') AS VARCHAR)"
 	}
 
-	shardMaxRows := cfg.ShardMaxRows
-	if shardMaxRows <= 0 {
-		shardMaxRows = 10
+	loadQuery := fmt.Sprintf(`
+		CREATE TEMP TABLE apple_snapshot AS
+		SELECT
+			CAST(Z_PK AS BIGINT) AS recording_id,
+			CAST('%s/' || ZPATH AS VARCHAR) AS audio_path,
+			%s AS title,
+			%s AS created_at,
+			%s AS duration_seconds,
+			%s AS transcription,
+			%s AS latitude,
+			%s AS longitude,
+			%s AS place_name,
+			%s AS device,
+			%s AS folder
+		FROM apple.ZCLOUDRECORDING
+	`, strings.ReplaceAll(recordingsDir, "'", "''"), titleCol, dateExpr, durationCol, transcriptionCol, latCol, lonCol, placeCol, deviceCol, folderCol)
+
+	if _, err := db.Exec(loadQuery); err != nil {
+		return fmt.Errorf("failed to snapshot Voice Memos rows: %w", err)
 	}
 
-	var totalNew int64
-	countQuery := `SELECT COUNT(*) FROM apple.ZCLOUDRECORDING
-		WHERE Z_PK NOT IN (SELECT recording_id FROM uploaded)
-		  AND Z_PK NOT IN (SELECT recording_id FROM local_pending)`
-	if err := db.QueryRow(countQuery).Scan(&totalNew); err != nil {
-		return fmt.Errorf("failed to count new memos: %w", err)
-	}
-
-	if totalNew == 0 {
-		slog.Info("no new memos detected")
-		return nil
-	}
-
-	var totalWritten int64
-	for offset := int64(0); offset < totalNew; offset += int64(shardMaxRows) {
-		maxShard++
-		tempShardPath := filepath.Join(shardDir, fmt.Sprintf("shard_%04d_tmp.parquet", maxShard))
-		finalShardPath := filepath.Join(shardDir, fmt.Sprintf("shard_%04d.parquet", maxShard))
-
-		copyQuery := fmt.Sprintf(`
-			COPY (
-				SELECT 
-					CAST(Z_PK AS BIGINT) AS recording_id,
-					CAST(NULL AS BLOB) AS audio,
-					CAST(NULL AS BLOB) AS audio_original,
-					CAST('%s/' || ZPATH AS VARCHAR) AS audio_path,
-					%s AS title,
-					%s AS created_at,
-					%s AS duration_seconds,
-					%s AS transcription,
-					%s AS latitude,
-					%s AS longitude,
-					%s AS place_name,
-					%s AS device,
-					%s AS folder
-				FROM apple.ZCLOUDRECORDING
-				WHERE Z_PK NOT IN (SELECT recording_id FROM uploaded)
-				  AND Z_PK NOT IN (SELECT recording_id FROM local_pending)
-				ORDER BY Z_PK
-				LIMIT %d OFFSET %d
-			) TO '%s' (FORMAT PARQUET, ROW_GROUP_SIZE 1)
-		`, strings.ReplaceAll(recordingsDir, "'", "''"), titleCol, dateExpr, durationCol, transcriptionCol, latCol, lonCol, placeCol, deviceCol, folderCol, shardMaxRows, offset, tempShardPath)
-
-		var rowsWritten int64
-		if err := db.QueryRow(copyQuery).Scan(&rowsWritten); err != nil {
-			return fmt.Errorf("failed to write shard %d: %w", maxShard, err)
-		}
-
-		if rowsWritten == 0 {
-			os.Remove(tempShardPath)
-			break
-		}
-
-		if err := os.Rename(tempShardPath, finalShardPath); err != nil {
-			return fmt.Errorf("failed to rename temp shard: %w", err)
-		}
-
-		totalWritten += rowsWritten
-		slog.Info("wrote shard", "shard", finalShardPath, "rows", rowsWritten)
-	}
-
-	slog.Info("detect phase complete",
-		slog.Int64("memos_found", totalWritten),
-		slog.Int("shard_count", maxShard),
-		slog.String("dedup_mode", dedupMode),
-	)
-
+	slog.Debug("loaded apple_snapshot from DB copy; releasing Apple attach")
 	return nil
 }
 
-// attachAppleDB tries direct ATTACH first, falls back to copying the DB file
-// (handles iCloud/VoiceMemos WAL locks and macOS TCC restrictions).
-func attachAppleDB(db *sql.DB, path string) error {
+// snapshotAppleDB copies the SQLite main file plus -wal/-shm sidecars when present.
+func snapshotAppleDB(path string) (string, func(), error) {
+	src, err := os.Open(path)
+	if err != nil {
+		return "", nil, fmt.Errorf("Voice Memos DB not accessible — grant Full Disk Access to vmc: %w", err)
+	}
+	defer src.Close()
+
+	tmp, err := os.CreateTemp("", "vmc_voicememos_*.db")
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to create temp copy: %w", err)
+	}
+	tmpPath := tmp.Name()
+
+	cleanup := func() {
+		os.Remove(tmpPath)
+		os.Remove(tmpPath + "-wal")
+		os.Remove(tmpPath + "-shm")
+	}
+
+	if _, err := io.Copy(tmp, src); err != nil {
+		tmp.Close()
+		cleanup()
+		return "", nil, fmt.Errorf("failed to copy Voice Memos DB: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		cleanup()
+		return "", nil, fmt.Errorf("failed to close Voice Memos DB copy: %w", err)
+	}
+
+	for _, suffix := range []string{"-wal", "-shm"} {
+		side := path + suffix
+		if _, err := os.Stat(side); err != nil {
+			continue
+		}
+		if err := copyFile(side, tmpPath+suffix); err != nil {
+			cleanup()
+			return "", nil, fmt.Errorf("failed to copy Voice Memos DB sidecar %s: %w", suffix, err)
+		}
+	}
+
+	return tmpPath, cleanup, nil
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+	return out.Close()
+}
+
+func attachApplePath(db *sql.DB, path string) error {
 	attachQuery := fmt.Sprintf("ATTACH '%s' AS apple (TYPE sqlite, READ_ONLY);", strings.ReplaceAll(path, "'", "''"))
 
 	for i := range 3 {
@@ -248,31 +353,7 @@ func attachAppleDB(db *sql.DB, path string) error {
 		time.Sleep(time.Duration(i+1) * 500 * time.Millisecond)
 	}
 
-	// Direct access failed — copy DB to temp and attach copy
-	src, err := os.Open(path)
-	if err != nil {
-		return fmt.Errorf("Voice Memos DB not accessible — grant Full Disk Access to vmc: %w", err)
-	}
-	defer src.Close()
-
-	tmp, err := os.CreateTemp("", "vmc_voicememos_*.db")
-	if err != nil {
-		return fmt.Errorf("failed to create temp copy: %w", err)
-	}
-	if _, err := io.Copy(tmp, src); err != nil {
-		tmp.Close()
-		os.Remove(tmp.Name())
-		return fmt.Errorf("failed to copy Voice Memos DB: %w", err)
-	}
-	tmp.Close()
-
-	attachCopy := fmt.Sprintf("ATTACH '%s' AS apple (TYPE sqlite, READ_ONLY);", strings.ReplaceAll(tmp.Name(), "'", "''"))
-	if _, err := db.Exec(attachCopy); err != nil {
-		os.Remove(tmp.Name())
-		return fmt.Errorf("failed to attach copied Voice Memos DB: %w", err)
-	}
-	// tmp file cleaned up by caller via defer os.Remove after DETACH
-	return nil
+	return fmt.Errorf("failed to attach Voice Memos DB snapshot at %s", path)
 }
 
 func fetchRemoteRecordingIDs(cfg *config.Config) ([]int64, error) {
@@ -298,7 +379,10 @@ func fetchRemoteRecordingIDs(cfg *config.Config) ([]int64, error) {
 		return nil, fmt.Errorf("HF API returned %d", resp.StatusCode)
 	}
 
+	// Hub /tree/ returns "path"; /siblings returns "rfilename". Accept both.
 	var files []struct {
+		Type      string `json:"type"`
+		Path      string `json:"path"`
 		RfileName string `json:"rfilename"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&files); err != nil {
@@ -307,13 +391,29 @@ func fetchRemoteRecordingIDs(cfg *config.Config) ([]int64, error) {
 
 	var allIDs []int64
 	for _, f := range files {
-		if !strings.HasSuffix(f.RfileName, ".parquet") {
+		if f.Type != "" && f.Type != "file" {
 			continue
 		}
-		fileURL := fmt.Sprintf("%s/datasets/%s/resolve/main/data/%s", cfg.HFBaseURL, cfg.HFRepo, f.RfileName)
+		rel := f.Path
+		if rel == "" {
+			rel = f.RfileName
+		}
+		if rel == "" {
+			continue
+		}
+		base := filepath.Base(rel)
+		if !strings.HasSuffix(base, ".parquet") {
+			continue
+		}
+		// Tree paths are usually "data/shard_….parquet"; siblings may be bare names.
+		resolvePath := rel
+		if !strings.Contains(rel, "/") {
+			resolvePath = "data/" + rel
+		}
+		fileURL := fmt.Sprintf("%s/datasets/%s/resolve/main/%s", cfg.HFBaseURL, cfg.HFRepo, resolvePath)
 		ids, err := readRecordingIDs(client, cfg.HFToken, fileURL)
 		if err != nil {
-			slog.Warn("failed to read remote parquet for dedup", "file", f.RfileName, "error", err)
+			slog.Warn("failed to read remote parquet for dedup", "file", resolvePath, "error", err)
 			continue
 		}
 		allIDs = append(allIDs, ids...)
@@ -358,7 +458,8 @@ func readRecordingIDs(client *http.Client, token, fileURL string) ([]int64, erro
 	}
 	defer sqlDB.Close()
 
-	rows, err := sqlDB.Query(fmt.Sprintf("SELECT recording_id FROM '%s'", strings.ReplaceAll(tmpPath, "'", "''")))
+	// Project only recording_id — still downloads the file, but avoids scanning blobs in Go.
+	rows, err := sqlDB.Query(fmt.Sprintf("SELECT recording_id FROM read_parquet('%s')", strings.ReplaceAll(tmpPath, "'", "''")))
 	if err != nil {
 		return nil, err
 	}

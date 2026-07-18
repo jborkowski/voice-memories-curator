@@ -44,6 +44,7 @@ func Run(db *sql.DB, cfg *config.Config) error {
 
 	var totalProcessed int
 	var anySkipped bool
+	var firstErr error
 
 	for _, shardPath := range matches {
 		if strings.HasSuffix(shardPath, "_tmp.parquet") {
@@ -53,6 +54,9 @@ func Run(db *sql.DB, cfg *config.Config) error {
 		processedCount, skippedCount, err := processShard(db, shardPath)
 		if err != nil {
 			slog.Error("failed to process shard", "shard", shardPath, "error", err)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("process %s: %w", shardPath, err)
+			}
 			continue
 		}
 
@@ -62,13 +66,13 @@ func Run(db *sql.DB, cfg *config.Config) error {
 		}
 	}
 
-	if totalProcessed == 0 && !anySkipped {
+	if totalProcessed == 0 && !anySkipped && firstErr == nil {
 		slog.Info("no unprocessed memos found")
 	} else if totalProcessed > 0 {
 		slog.Info("process phase complete", "total_processed", totalProcessed)
 	}
 
-	return nil
+	return firstErr
 }
 
 func processShard(db *sql.DB, shardPath string) (int, int, error) {

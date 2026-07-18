@@ -25,23 +25,13 @@ No status column. No state file. No schema migrations.
 Query Apple's DB, subtract everything already known (on HF and in local shards).
 
 ```sql
-ATTACH '~/Library/.../CloudRecordings.db' AS apple (TYPE sqlite, READ_ONLY);
-
--- What's already on HF?
-CREATE TEMP TABLE uploaded AS
-  SELECT recording_id FROM 'hf://datasets/{user}/{repo}/data/*.parquet';
-
--- What's already in local shards?
-CREATE TEMP TABLE local_pending AS
-  SELECT recording_id FROM '~/.local/share/vmc/shards/*.parquet';
-
--- New memos = in Apple DB but not in either place
-SELECT * FROM apple.ZCLOUDRECORDING
-WHERE Z_PK NOT IN (SELECT recording_id FROM uploaded)
-  AND Z_PK NOT IN (SELECT recording_id FROM local_pending);
+-- 1) Dedup against HF + local shards FIRST (no Apple DB lock).
+-- 2) Snapshot CloudRecordings.db (+ WAL/SHM), ATTACH copy briefly,
+--    CREATE TEMP TABLE apple_snapshot AS SELECT …, DETACH.
+-- 3) Write metadata-only Parquet rows from apple_snapshot.
 ```
 
-Write metadata-only rows (with `audio = NULL`) to the current local shard.
+Write metadata-only rows (with `audio = NULL`) to the current local shard. Never hold a live ATTACH across Hugging Face network I/O.
 
 ## Phase 2: Process — "Which rows need audio?"
 

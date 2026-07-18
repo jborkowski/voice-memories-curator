@@ -8,7 +8,9 @@ run: build
 
 install: build
 	install -d $(HOME)/.local/bin
+	install -d $(HOME)/.local/share/vmc
 	install -m 755 vmc $(HOME)/.local/bin/vmc
+	install -m 644 scripts/fix_hf_parquet.py $(HOME)/.local/share/vmc/fix_hf_parquet.py
 
 permissions:
 	open "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_AllFiles"

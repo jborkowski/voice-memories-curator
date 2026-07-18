@@ -88,7 +88,7 @@ Requires CGO (`github.com/marcboeker/go-duckdb`). Binary ~80MB.
 ### 3. Data Source: macOS Voice Memos
 
 - Path: `~/Library/Application Support/com.apple.voicememos/Recordings/CloudRecordings.db`
-- Attached read-only: `ATTACH '...' AS apple (TYPE sqlite, READ_ONLY);`
+- Accessed via a short-lived snapshot: copy `CloudRecordings.db` (+ `-wal`/`-shm` when present), `ATTACH` the copy read-only just long enough to materialize rows into DuckDB, then `DETACH` before any Hugging Face network I/O.
 - Requires **Full Disk Access** TCC permission
 
 ### 4. Metadata Collected Per Memory

@@ -12,7 +12,8 @@ type Config struct {
 	HFToken            string `toml:"hf_token"`
 	HFRepo             string `toml:"hf_repo"`
 	HFPrivate          bool   `toml:"hf_private"`
-	SyncInterval       int    `toml:"sync_interval"`
+	SyncInterval       int    `toml:"sync_interval"` // informational; brew service interval owns detect/process cadence
+	UploadInterval     int    `toml:"upload_interval"`
 	LogLevel           string `toml:"log_level"`
 	ShardDir           string `toml:"shard_dir"`
 	ShardMaxRows       int    `toml:"shard_max_rows"`
@@ -27,6 +28,7 @@ func DefaultConfig() *Config {
 		HFRepo:             "voice-memories",
 		HFPrivate:          true,
 		SyncInterval:       3600,
+		UploadInterval:     604800, // weekly publish by default
 		LogLevel:           "info",
 		ShardDir:           "~/.local/share/vmc/shards",
 		ShardMaxRows:       10,

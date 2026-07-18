@@ -19,7 +19,7 @@ footer contains the correct feature descriptors.
 
 Usage:
     # Download, fix, and re-upload in one shot
-    uv run scripts/fix_hf_parquet.py
+    uv run scripts/fix_hf_parquet.py --repo USER/voice-memories
 
     # Fix local shards only (skip download/upload)
     uv run scripts/fix_hf_parquet.py --local ./downloaded_shards -o ./fixed_shards
@@ -37,7 +37,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from datasets import Audio, Dataset
 
-HF_REPO = "j14i/voice-memories"
+DEFAULT_REPO = os.environ.get("HF_REPO", "j14i/voice-memories")
 AUDIO_COLUMNS = ("audio", "audio_original")
 
 
@@ -93,6 +93,11 @@ def main() -> None:
         description="Rewrite Parquet shards with HF datasets audio metadata"
     )
     parser.add_argument(
+        "--repo",
+        default=DEFAULT_REPO,
+        help="HF dataset repo (default: $HF_REPO or j14i/voice-memories)",
+    )
+    parser.add_argument(
         "--local",
         help="Local directory or glob pattern instead of downloading from HF",
     )
@@ -100,6 +105,7 @@ def main() -> None:
         "-o", "--output", help="Output directory for fixed shards (default: temp dir)"
     )
     args = parser.parse_args()
+    hf_repo = args.repo
 
     if args.local:
         input_dir = args.local
@@ -118,7 +124,7 @@ def main() -> None:
         print(f"\nDone! Fixed shards in: {out_dir}")
         print(
             f"Upload with:\n"
-            f"  hf upload {HF_REPO} {out_dir} data/ --type dataset"
+            f"  hf upload {hf_repo} {out_dir} data/ --type dataset"
         )
         return
 
@@ -126,9 +132,9 @@ def main() -> None:
         dl_dir = os.path.join(tmp, "download")
         fix_dir = args.output or os.path.join(tmp, "fixed")
 
-        print(f"Downloading shards from {HF_REPO}...")
+        print(f"Downloading shards from {hf_repo}...")
         run([
-            "hf", "download", HF_REPO,
+            "hf", "download", hf_repo,
             "--type", "dataset",
             "--include", "data/*.parquet",
             "--local-dir", dl_dir,
@@ -144,9 +150,9 @@ def main() -> None:
         for f in files:
             fix_parquet_shard(f, fix_dir)
 
-        print(f"\nUploading fixed shards to {HF_REPO}...")
+        print(f"\nUploading fixed shards to {hf_repo}...")
         run([
-            "hf", "upload", HF_REPO,
+            "hf", "upload", hf_repo,
             fix_dir, "data/",
             "--type", "dataset",
         ])

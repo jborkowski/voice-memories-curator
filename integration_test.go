@@ -58,8 +58,8 @@ func TestEndToEnd(t *testing.T) {
 		t.Fatalf("process failed: %v", err)
 	}
 
-	// Phase 3: Upload
-	if err := upload.Run(db, cfg); err != nil {
+	// Phase 3: Upload (force — ignore weekly cadence in CI)
+	if err := upload.RunWithOptions(db, cfg, true); err != nil {
 		t.Fatalf("upload failed: %v", err)
 	}
 
@@ -107,7 +107,7 @@ func TestEndToEndOffline(t *testing.T) {
 	}
 
 	// Upload should exit cleanly when offline
-	if err := upload.Run(db, cfg); err != nil {
+	if err := upload.RunWithOptions(db, cfg, true); err != nil {
 		t.Fatalf("upload should not error when offline: %v", err)
 	}
 

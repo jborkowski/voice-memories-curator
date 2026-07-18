@@ -2,6 +2,8 @@
 
 A macOS daemon that periodically extracts macOS Voice Memos, transcodes audio to FLAC, and uploads Parquet shards to a private Hugging Face dataset.
 
+Detect/process run hourly via `brew services`. Hub upload is gated by `upload_interval` (default **weekly**) so the Voice Memos database and HF are not hammered every hour.
+
 ## Installation
 
 ### Homebrew (recommended)
@@ -9,11 +11,12 @@ A macOS daemon that periodically extracts macOS Voice Memos, transcodes audio to
 ```bash
 brew tap jborkowski/vmc https://github.com/jborkowski/voice-memories-curator
 brew install --HEAD vmc
+git xet install
 ```
 
-This installs `vmc` and its dependencies (`ffmpeg`, `git-xet`) automatically.
+This installs `vmc`, `ffmpeg`, `git-xet`, and the Viewer repair helper script.
 
-To run as a background service (syncs every hour):
+To run as a background service:
 
 ```bash
 brew services start vmc
@@ -26,6 +29,7 @@ Prerequisites:
 - CGO enabled (required for DuckDB)
 - Go 1.22+
 - ffmpeg
+- git-xet (`brew install git-xet && git xet install`)
 
 ```bash
 make build
@@ -46,49 +50,64 @@ export PATH="$HOME/.local/bin:$PATH"
 ~/Library/Application Support/com.apple.voicememos/Recordings/CloudRecordings.db
 ```
 
-macOS restricts access to this file. You must grant **Full Disk Access** to the terminal application you use to run `vmc`.
+macOS restricts access to this file. Grant **Full Disk Access** to the process that runs `vmc`:
 
-### Granting Full Disk Access
+| How you run `vmc` | Grant FDA to |
+|-------------------|--------------|
+| Interactive terminal | Your terminal app (Terminal, iTerm2, Warp, etc.) |
+| `brew services` / launchd | The `vmc` binary (e.g. `/opt/homebrew/opt/vmc/bin/vmc`) |
+| `make install` binary | `~/.local/bin/vmc` |
 
-Open the Full Disk Access settings pane directly from the terminal:
+Open the Full Disk Access settings pane:
 
 ```bash
 make permissions
 ```
 
-Then:
+Then add the binary or terminal app and restart the process.
 
-1. Click the **+** button (you may need to unlock with your password)
-2. Add your terminal app (e.g. Terminal.app, iTerm2, Alacritty, Warp, or the VS Code/Cursor integrated terminal)
-3. Restart the terminal after granting access
-
-> **Note:** If you run `vmc` via a launchd agent or cron, the parent process (e.g. `launchd`) must also have Full Disk Access.
-
-If you see the error:
+If you see:
 ```
-cannot open Voice Memos database — is Full Disk Access enabled for this terminal?
+cannot open Voice Memos database — grant Full Disk Access to vmc
 ```
-it means the running process does not yet have the required permission.
+the running process does not yet have the required permission.
 
 ## Configuration
 
-Configuration is read from `~/.config/vmc/config.toml`. 
+Configuration is read from `~/.config/vmc/config.toml`. Prefer `HF_TOKEN` in the environment over storing the token in the file.
 
 Example:
 ```toml
-hf_token = "YOUR_TOKEN"
-hf_repo = "voice-memories"
+# Prefer: export HF_TOKEN=hf_...
+# hf_token = "hf_..."
+hf_repo = "YOUR_USER/voice-memories"
 hf_private = true
-sync_interval = 3600
+sync_interval = 3600          # documented brew detect/process cadence (informational)
+upload_interval = 604800      # seconds between Hub publishes (default: 1 week)
 log_level = "info"
 shard_dir = "~/.local/share/vmc/shards"
 keep_uploaded_shards = false
 ```
+
+| Key | Role |
+|-----|------|
+| `sync_interval` | Documents the intended detect/process cadence. Homebrew `interval 3600` owns the actual schedule. |
+| `upload_interval` | Minimum seconds between Hub uploads (default `604800`). Detect/process still run every service tick. |
 
 ## Running
 
 ```bash
 vmc --help
 vmc status
-vmc daemon
+vmc daemon                 # detect → process → upload (if interval elapsed)
+vmc daemon --force-upload  # always attempt upload this pass
+vmc upload --force         # publish ready shards now
 ```
+
+Only one daemon/upload instance runs at a time (`~/.local/share/vmc/vmc.lock`).
+
+## Design notes
+
+- Apple’s `CloudRecordings.db` is **snapshotted** (main DB + WAL/SHM) and released before any Hugging Face network I/O, so Voice Memos is not held open during uploads or remote dedup.
+- Ready shards are published in **one** git clone/commit/push batch.
+- When `uv` or `python3` plus `scripts/fix_hf_parquet.py` are available, shards are rewritten with Hugging Face Audio footer metadata before push (Dataset Viewer).

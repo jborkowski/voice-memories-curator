@@ -129,4 +129,4 @@ Pipeline state lives in Parquet shards (`audio IS NULL` = unprocessed; row on HF
 | Apple DB schema differences across macOS versions | B | Resolved — detect code introspects `information_schema.columns` and adapts. Tests use the minimal schema the detect code actually queries. |
 | Max shard size before splitting | B/C | Resolved — tests use small shards (3–5 rows). Production can default to unbounded (one shard per detect pass). |
 | Memory strategy for large FLAC blobs in Parquet | C | Resolved — not relevant for small test fixtures. Production shards stay small due to per-pass batching. |
-| HF upload mechanism: git-based or API-based? | D | Resolved — API-based (POST to `/api/datasets/{repo}/upload/main/{path}`). |
+| HF upload mechanism: git-based or API-based? | D | Resolved — git-xet batch clone/commit/push; Viewer metadata via `fix_hf_parquet.py` when available. |
