@@ -30,14 +30,15 @@ var rootCmd = &cobra.Command{
 		initConfig()
 		initLogger(cmd.Name())
 
-		// logs only needs config + logger; skip DuckDB to avoid lock contention.
-		if cmd.Name() == "logs" {
+		// Status/logs only need config (+ ephemeral DuckDB for status).
+		// Never open the shared vmc.db here — the daemon may hold that lock.
+		if cmd.Name() == "logs" || cmd.Name() == "status" {
 			return nil
 		}
 		return initDB()
 	},
 	PersistentPostRunE: func(cmd *cobra.Command, args []string) error {
-		if cmd.Name() == "help" || cmd.Name() == "completion" || cmd.Name() == "logs" {
+		if cmd.Name() == "help" || cmd.Name() == "completion" || cmd.Name() == "logs" || cmd.Name() == "status" {
 			return nil
 		}
 		cleanup()
