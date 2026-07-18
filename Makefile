@@ -10,10 +10,12 @@ install: build
 	install -d $(HOME)/.local/bin
 	install -d $(HOME)/.local/share/vmc
 	install -m 755 vmc $(HOME)/.local/bin/vmc
+	install -m 755 scripts/grant-fda.sh $(HOME)/.local/bin/vmc-grant-fda
 	install -m 644 scripts/fix_hf_parquet.py $(HOME)/.local/share/vmc/fix_hf_parquet.py
 
+# Open FDA + put ~/Desktop/vmc ready to drag into the list.
 permissions:
-	open "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_AllFiles"
+	bash scripts/grant-fda.sh
 
 clean:
 	rm -f vmc

@@ -13,6 +13,7 @@ class Vmc < Formula
     ENV["CGO_ENABLED"] = "1"
     system "go", "build", *std_go_args(ldflags: "-s -w"), "."
     (share/"vmc").install "scripts/fix_hf_parquet.py"
+    bin.install "scripts/grant-fda.sh" => "vmc-grant-fda"
   end
 
   service do
@@ -23,32 +24,23 @@ class Vmc < Formula
     log_path var/"log/vmc.log"
     error_log_path var/"log/vmc.log"
     run_type :interval
-    # Hourly detect/process; upload is gated by upload_interval (default weekly).
+    # Hourly detect → process → upload (upload pushes only shards missing on Hub).
     interval 3600
   end
 
   def caveats
     <<~EOS
-      To allow vmc to read Voice Memos, grant Full Disk Access to the binary:
-        System Settings → Privacy & Security → Full Disk Access → add #{opt_bin}/vmc
+      Full Disk Access (required for brew services):
+        vmc-grant-fda
+      Then drag ~/Desktop/vmc into the Full Disk Access list and turn it ON.
+      Docs: https://github.com/jborkowski/voice-memories-curator/blob/main/docs/02-ops-flow.md
 
-      Prefer HF_TOKEN in the environment (or a private config file):
-        mkdir -p ~/.config/vmc
-        cat > ~/.config/vmc/config.toml <<EOF
-      hf_repo = "YOUR_USER/voice-memories"
-      hf_private = true
-      upload_interval = 604800
-      EOF
-        # launchd does not inherit your shell; put the token in the config or wrap the service.
+      Config ~/.config/vmc/config.toml (hf_token + hf_repo). Prefer HF_TOKEN env if you wrap the service.
 
       After install, once:
         git xet install
-
-      Then start the service (detect/process hourly; Hub upload ~weekly):
+        vmc-grant-fda
         brew services start vmc
-
-      Force an immediate upload:
-        vmc upload --force
     EOS
   end
 

@@ -2,7 +2,7 @@
 
 A macOS daemon that periodically extracts macOS Voice Memos, transcodes audio to FLAC, and uploads Parquet shards to a private Hugging Face dataset.
 
-Detect/process run hourly via `brew services`. Hub upload is gated by `upload_interval` (default **weekly**) so the Voice Memos database and HF are not hammered every hour.
+Detect/process/upload run hourly via `brew services`. Upload pushes only shards that are missing from Hugging Face. Ops details: [docs/02-ops-flow.md](docs/02-ops-flow.md).
 
 ## Installation
 
@@ -42,35 +42,22 @@ Make sure `~/.local/bin` is in your `$PATH`:
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-## Permissions
+## Permissions (Full Disk Access)
 
-`vmc` reads the macOS Voice Memos SQLite database at:
-
-```
-~/Library/Application Support/com.apple.voicememos/Recordings/CloudRecordings.db
-```
-
-macOS restricts access to this file. Grant **Full Disk Access** to the process that runs `vmc`:
-
-| How you run `vmc` | Grant FDA to |
-|-------------------|--------------|
-| Interactive terminal | Your terminal app (Terminal, iTerm2, Warp, etc.) |
-| `brew services` / launchd | The `vmc` binary (e.g. `/opt/homebrew/opt/vmc/bin/vmc`) |
-| `make install` binary | `~/.local/bin/vmc` |
-
-Open the Full Disk Access settings pane:
+`brew services` runs the `vmc` binary under launchd. That binary needs **Full Disk Access**.
 
 ```bash
-make permissions
+vmc-grant-fda
+# or: make permissions
 ```
 
-Then add the binary or terminal app and restart the process.
+This puts `~/Desktop/vmc` in Finder and opens Full Disk Access. **Drag `Desktop/vmc` into the list**, enable the toggle, then:
 
-If you see:
+```bash
+brew services restart vmc
 ```
-cannot open Voice Memos database — grant Full Disk Access to vmc
-```
-the running process does not yet have the required permission.
+
+If you see `grant Full Disk Access` / `operation not permitted`, FDA is missing or stale after upgrade — run `vmc-grant-fda` again.
 
 ## Configuration
 
