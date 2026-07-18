@@ -79,30 +79,23 @@ func RunWithOptions(db *sql.DB, cfg *config.Config, force bool) error {
 		return nil
 	}
 
-	// Automatic workflow: ready shards always publish. upload_interval only
-	// throttles when everything is already on Hub (keep_uploaded_shards=true).
-	if !force {
-		ok, err := ShouldUpload(cfg, false)
-		if err != nil {
-			return fmt.Errorf("upload cadence check failed: %w", err)
-		}
-		if !ok {
-			remote, err := listRemoteShardNames(cfg)
-			if err != nil {
-				slog.Warn("remote shard listing failed; uploading ready shards anyway", "error", err)
-			} else {
-				readyShards = filterMissingRemote(readyShards, remote)
-				if len(readyShards) == 0 {
-					slog.Info("all ready shards already on Hub; upload_interval not elapsed")
-					return nil
-				}
-			}
-		}
-	}
-
 	if err := checkConnectivity(cfg); err != nil {
 		slog.Info(fmt.Sprintf("offline, %d shards ready", len(readyShards)))
 		return nil
+	}
+
+	// Automatic: only push shards Hub does not already have (no --force needed).
+	if !force {
+		remote, err := listRemoteShardNames(cfg)
+		if err != nil {
+			slog.Warn("remote shard listing failed; uploading all ready shards", "error", err)
+		} else {
+			readyShards = filterMissingRemote(readyShards, remote)
+			if len(readyShards) == 0 {
+				slog.Info("all ready shards already on Hub")
+				return nil
+			}
+		}
 	}
 
 	slog.Info(fmt.Sprintf("%d shards ready for upload", len(readyShards)))
@@ -304,9 +297,13 @@ Private dataset of Apple Voice Memos, transcoded to FLAC 16kHz mono.
 `
 }
 
+func authenticatedDatasetURL(cfg *config.Config) string {
+	return fmt.Sprintf("https://x-access-token:%s@huggingface.co/datasets/%s", cfg.HFToken, cfg.HFRepo)
+}
+
 func cloneDatasetRepo(cfg *config.Config, repoDir string) error {
 	// HF git auth: token in URL (Bearer http.extraHeader is rejected by Hub git).
-	repoURL := fmt.Sprintf("https://x-access-token:%s@huggingface.co/datasets/%s", cfg.HFToken, cfg.HFRepo)
+	repoURL := authenticatedDatasetURL(cfg)
 	if err := gitCmd(repoDir, "clone", "--depth=1", repoURL, "."); err != nil {
 		createErr := createRepo(cfg)
 		if createErr != nil && !isRepoExistsErr(createErr) {

@@ -46,3 +46,26 @@ func TestShouldUploadForceAndCadence(t *testing.T) {
 		t.Fatalf("stale last_upload should allow upload: ok=%v err=%v", ok, err)
 	}
 }
+
+// Auto flow: even when cadence says "skip", missing remote shards still upload.
+func TestAutoFlowUploadsMissingDespiteCadence(t *testing.T) {
+	local := []string{"/data/shard_0009.parquet", "/data/shard_0010.parquet"}
+	remote := map[string]struct{}{"shard_0009.parquet": {}}
+	missing := filterMissingRemote(local, remote)
+	if len(missing) != 1 || filepath.Base(missing[0]) != "shard_0010.parquet" {
+		t.Fatalf("auto flow must select missing shard, got %v", missing)
+	}
+	// Cadence false + missing non-empty => publish (logic in RunWithOptions).
+	cfg := &config.Config{ShardDir: t.TempDir(), UploadInterval: 999999}
+	_ = MarkUploaded(cfg)
+	ok, err := ShouldUpload(cfg, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("cadence should block empty republish")
+	}
+	if len(missing) == 0 {
+		t.Fatal("missing shards must still be uploaded when cadence blocks")
+	}
+}
