@@ -1,0 +1,10 @@
+name = "VmcLock"
+version = "0.2.1"
+defaultTargets = ["VmcLock"]
+
+[leanOptions]
+pp.unicode.fun = true
+autoImplicit = false
+
+[[lean_lib]]
+name = "VmcLock"

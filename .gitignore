@@ -19,3 +19,4 @@ testdata/sample.m4a
 
 # pi (coding agent) local state
 .pi/
+formal/VmcLock/.lake/
