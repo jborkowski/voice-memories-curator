@@ -48,16 +48,9 @@ export PATH="$HOME/.local/bin:$PATH"
 
 ```bash
 vmc-grant-fda
-# or: make permissions
 ```
 
-This puts `~/Desktop/vmc` in Finder and opens Full Disk Access. **Drag `Desktop/vmc` into the list**, enable the toggle, then:
-
-```bash
-brew services restart vmc
-```
-
-If you see `grant Full Disk Access` / `operation not permitted`, FDA is missing or stale after upgrade — run `vmc-grant-fda` again.
+Creates **`Desktop/VMC.app`**. Drag it into Full Disk Access → ON → `brew services restart vmc`.
 
 ## Configuration
 

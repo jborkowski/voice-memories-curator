@@ -32,20 +32,14 @@ vmc-grant-fda
 # or: make permissions
 ```
 
-This:
+This builds **`~/Desktop/VMC.app`** (+ `~/Applications/VMC.app`), reveals it, opens **Full Disk Access**.
 
-1. Resolves the real Cellar binary
-2. Copies it to `~/Desktop/vmc` (visible drag target)
-3. Reveals it in Finder
-4. Opens **System Settings → Privacy & Security → Full Disk Access**
+Then:
 
-Then: **drag `Desktop/vmc` into the FDA list** → toggle ON →:
+1. Drag **`VMC.app`** into the FDA list → toggle ON  
+2. `brew services restart vmc`
 
-```bash
-brew services restart vmc
-```
-
-After `brew reinstall` / new HEAD, run `vmc-grant-fda` again if FDA breaks (binary path under Cellar changes).
+`brew services` runs `vmc-service` → `~/Applications/VMC.app/Contents/Resources/vmc` (inside the app you granted). After upgrades, run `vmc-grant-fda` again to refresh the app binary.
 
 ## Install / upgrade
 
