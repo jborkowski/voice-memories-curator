@@ -3,6 +3,7 @@ package upload
 import (
 	"bytes"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -17,7 +18,8 @@ import (
 )
 
 // Run uploads all ready shards in a single git clone/commit/push.
-// When force is false, respects upload_interval (default weekly).
+// Ready shards missing from Hub always publish; upload_interval only throttles
+// when everything is already remote.
 func Run(db *sql.DB, cfg *config.Config) error {
 	return RunWithOptions(db, cfg, false)
 }
@@ -29,16 +31,6 @@ func RunWithOptions(db *sql.DB, cfg *config.Config, force bool) error {
 
 	if _, err := exec.LookPath("git-xet"); err != nil {
 		return fmt.Errorf("git-xet not found — install it with: brew install git-xet && git xet install")
-	}
-
-	ok, err := ShouldUpload(cfg, force)
-	if err != nil {
-		return fmt.Errorf("upload cadence check failed: %w", err)
-	}
-	if !ok {
-		slog.Info("skipping upload — upload_interval has not elapsed",
-			"upload_interval_s", effectiveUploadInterval(cfg))
-		return nil
 	}
 
 	homeDir, err := os.UserHomeDir()
@@ -85,6 +77,27 @@ func RunWithOptions(db *sql.DB, cfg *config.Config, force bool) error {
 		}
 		slog.Info("0 shards ready")
 		return nil
+	}
+
+	// Automatic workflow: ready shards always publish. upload_interval only
+	// throttles when everything is already on Hub (keep_uploaded_shards=true).
+	if !force {
+		ok, err := ShouldUpload(cfg, false)
+		if err != nil {
+			return fmt.Errorf("upload cadence check failed: %w", err)
+		}
+		if !ok {
+			remote, err := listRemoteShardNames(cfg)
+			if err != nil {
+				slog.Warn("remote shard listing failed; uploading ready shards anyway", "error", err)
+			} else {
+				readyShards = filterMissingRemote(readyShards, remote)
+				if len(readyShards) == 0 {
+					slog.Info("all ready shards already on Hub; upload_interval not elapsed")
+					return nil
+				}
+			}
+		}
 	}
 
 	if err := checkConnectivity(cfg); err != nil {
@@ -179,7 +192,6 @@ func uploadShardsBatch(db *sql.DB, cfg *config.Config, shardPaths []string) erro
 	if err := cloneDatasetRepo(cfg, repoDir); err != nil {
 		return err
 	}
-	gitAuth := cfg.HFToken
 
 	dataDir := filepath.Join(repoDir, "data")
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
@@ -190,7 +202,7 @@ func uploadShardsBatch(db *sql.DB, cfg *config.Config, shardPaths []string) erro
 	if err := os.WriteFile(readmePath, []byte(datasetCard()), 0644); err != nil {
 		return fmt.Errorf("failed to write dataset card: %w", err)
 	}
-	_ = gitCmd(repoDir, "", "add", "README.md")
+	_ = gitCmd(repoDir, "add", "README.md")
 
 	var names []string
 	for _, src := range exported {
@@ -199,16 +211,16 @@ func uploadShardsBatch(db *sql.DB, cfg *config.Config, shardPaths []string) erro
 		if err := copyFile(src, destPath); err != nil {
 			return fmt.Errorf("failed to write parquet to repo: %w", err)
 		}
-		if err := gitCmd(repoDir, "", "add", "data/"+fileName); err != nil {
+		if err := gitCmd(repoDir, "add", "data/"+fileName); err != nil {
 			return fmt.Errorf("git add failed: %w", err)
 		}
 		names = append(names, fileName)
 	}
 
-	_ = gitCmd(repoDir, "", "add", "-A")
+	_ = gitCmd(repoDir, "add", "-A")
 
 	msg := fmt.Sprintf("Upload %d shard(s): %s", len(names), strings.Join(names, ", "))
-	if err := gitCmd(repoDir, "", "commit", "-m", msg); err != nil {
+	if err := gitCmd(repoDir, "commit", "-m", msg); err != nil {
 		if strings.Contains(err.Error(), "nothing to commit") || strings.Contains(err.Error(), "no changes added") {
 			slog.Info("shards already exist on HF with same content", "count", len(names))
 			return nil
@@ -216,9 +228,9 @@ func uploadShardsBatch(db *sql.DB, cfg *config.Config, shardPaths []string) erro
 		return fmt.Errorf("git commit failed: %w", err)
 	}
 
-	if err := gitCmd(repoDir, gitAuth, "push"); err != nil {
-		if pullErr := gitCmd(repoDir, gitAuth, "pull", "--rebase"); pullErr == nil {
-			if retryErr := gitCmd(repoDir, gitAuth, "push"); retryErr == nil {
+	if err := gitCmd(repoDir, "push"); err != nil {
+		if pullErr := gitCmd(repoDir, "pull", "--rebase"); pullErr == nil {
+			if retryErr := gitCmd(repoDir, "push"); retryErr == nil {
 				slog.Info("successfully uploaded shards to HF", "count", len(names), "repo", cfg.HFRepo)
 				return nil
 			} else {
@@ -293,35 +305,36 @@ Private dataset of Apple Voice Memos, transcoded to FLAC 16kHz mono.
 }
 
 func cloneDatasetRepo(cfg *config.Config, repoDir string) error {
-	repoURL := fmt.Sprintf("https://huggingface.co/datasets/%s", cfg.HFRepo)
-	if err := gitCloneWithToken(repoDir, repoURL, cfg.HFToken); err != nil {
-		if createErr := createRepo(cfg); createErr != nil {
+	// HF git auth: token in URL (Bearer http.extraHeader is rejected by Hub git).
+	repoURL := fmt.Sprintf("https://x-access-token:%s@huggingface.co/datasets/%s", cfg.HFToken, cfg.HFRepo)
+	if err := gitCmd(repoDir, "clone", "--depth=1", repoURL, "."); err != nil {
+		createErr := createRepo(cfg)
+		if createErr != nil && !isRepoExistsErr(createErr) {
 			return fmt.Errorf("clone failed and repo creation failed: clone=%w, create=%v", err, createErr)
 		}
-		if err := gitCloneWithToken(repoDir, repoURL, cfg.HFToken); err != nil {
-			return fmt.Errorf("clone failed after repo creation: %w", err)
+		if err := gitCmd(repoDir, "clone", "--depth=1", repoURL, "."); err != nil {
+			return fmt.Errorf("clone failed after repo create/exists: %w", err)
 		}
 	}
 	return nil
 }
 
-// gitCloneWithToken clones via Authorization header instead of embedding the
-// token in the remote URL (avoids leaking credentials in process listings).
-func gitCloneWithToken(repoDir, repoURL, token string) error {
-	return gitCmd(repoDir, token, "clone", "--depth=1", repoURL, ".")
+func isRepoExistsErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "409") || strings.Contains(s, "already created") || strings.Contains(s, "already exist")
 }
 
-func gitCmd(dir, token string, args ...string) error {
-	var cmdArgs []string
-	if token != "" {
-		cmdArgs = append(cmdArgs, "-c", "http.extraHeader=Authorization: Bearer "+token)
-	}
-	cmdArgs = append(cmdArgs, args...)
-	cmd := exec.Command("git", cmdArgs...)
+func gitCmd(dir string, args ...string) error {
+	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
 	var output bytes.Buffer
 	cmd.Stdout = &output
 	cmd.Stderr = &output
+	// Avoid interactive credential prompts in launchd/SSH.
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("%s: %s", err, output.String())
 	}
@@ -356,13 +369,65 @@ func createRepo(cfg *config.Config) error {
 	}
 	defer resp.Body.Close()
 
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode == 409 {
+		return fmt.Errorf("status 409: %s", strings.TrimSpace(string(body)))
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
 	slog.Info("created new HF dataset repo", "repo", cfg.HFRepo)
 	return nil
+}
+
+func listRemoteShardNames(cfg *config.Config) (map[string]struct{}, error) {
+	client := &http.Client{Timeout: 30 * time.Second}
+	apiURL := fmt.Sprintf("%s/api/datasets/%s/tree/main/data", cfg.HFBaseURL, cfg.HFRepo)
+	req, err := http.NewRequest("GET", apiURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+cfg.HFToken)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == 404 {
+		return map[string]struct{}{}, nil
+	}
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("HF tree API %d", resp.StatusCode)
+	}
+	var files []struct {
+		Type string `json:"type"`
+		Path string `json:"path"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&files); err != nil {
+		return nil, err
+	}
+	out := make(map[string]struct{})
+	for _, f := range files {
+		if f.Type != "" && f.Type != "file" {
+			continue
+		}
+		base := filepath.Base(f.Path)
+		if strings.HasSuffix(base, ".parquet") {
+			out[base] = struct{}{}
+		}
+	}
+	return out, nil
+}
+
+func filterMissingRemote(local []string, remote map[string]struct{}) []string {
+	var missing []string
+	for _, p := range local {
+		if _, ok := remote[filepath.Base(p)]; !ok {
+			missing = append(missing, p)
+		}
+	}
+	return missing
 }
 
 func copyFile(src, dst string) error {
