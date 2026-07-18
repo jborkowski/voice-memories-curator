@@ -27,12 +27,18 @@ resolve_vmc() {
 SRC="$(resolve_vmc)"
 DEST="${HOME}/Desktop/vmc"
 
-cp -f "${SRC}" "${DEST}"
-chmod +x "${DEST}"
-xattr -cr "${DEST}" 2>/dev/null || true
+# Hardlink = same inode as the brew/launchd binary (a copy would get FDA on the
+# Desktop path only, and brew services would still be denied).
+rm -f "${DEST}"
+if ! ln "${SRC}" "${DEST}" 2>/dev/null; then
+  # Cross-volume fallback: reveal the real binary instead of copying.
+  DEST="${SRC}"
+fi
 
-echo "Drag target: ${DEST}"
-echo "Source:      ${SRC}"
+echo "Drag THIS file into Full Disk Access:"
+echo "  ${DEST}"
+echo "launchd binary:"
+echo "  ${SRC}"
 
 open -R "${DEST}"
 open "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_AllFiles"
@@ -40,9 +46,9 @@ open "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Pri
 cat <<EOF
 
 Full Disk Access is open.
-1. Unlock the lock (bottom left) if needed
-2. Drag Desktop/vmc into the list (or + → Desktop → vmc)
-3. Ensure the toggle is ON
+1. Unlock (bottom left) if needed
+2. Drag the highlighted vmc into the list
+3. Toggle ON
 4. brew services restart vmc
 
 EOF
