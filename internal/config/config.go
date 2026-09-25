@@ -19,6 +19,7 @@ type Config struct {
 	HFPrivate          bool   `toml:"hf_private"`
 	SyncInterval       int    `toml:"sync_interval"`
 	UploadInterval     int    `toml:"upload_interval"`
+	UploadBatchSize    int    `toml:"upload_batch_size"` // shards per Hub commit (default 2)
 	LogLevel           string `toml:"log_level"`
 	ShardDir           string `toml:"shard_dir"`
 	ShardMaxRows       int    `toml:"shard_max_rows"`
@@ -116,6 +117,7 @@ func DefaultConfig() *Config {
 		HFPrivate:          true,
 		SyncInterval:       3600,
 		UploadInterval:     604800,
+		UploadBatchSize:    2,
 		LogLevel:           "info",
 		ShardDir:           "~/.local/share/vmc/shards",
 		ShardMaxRows:       10,

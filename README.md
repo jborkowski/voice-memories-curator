@@ -14,7 +14,7 @@ brew install --HEAD vmc
 git xet install
 ```
 
-This installs `vmc`, `ffmpeg`, `git-xet`, and the Viewer repair helper script.
+This installs `vmc`, `ffmpeg`, `git-xet`, Viewer repair (`fix_hf_parquet.py`), and Hub upload (`upload_hf_shards.py`) under `share/vmc`. Service logs: `$(brew --prefix)/var/log/vmc.log`.
 
 To run as a background service:
 
@@ -33,8 +33,19 @@ Prerequisites:
 
 ```bash
 make build
-make install   # installs to ~/.local/bin
+make install   # ~/.local/bin + share/{fix_hf_parquet,upload_hf_shards}.py
+make test      # go test ./...
 ```
+
+Homebrew after pushing `main`:
+
+```bash
+make brew-reinstall   # brew install --HEAD
+make brew-restart     # FDA refresh + brew services restart
+make logs             # tail $(brew --prefix)/var/log/vmc.log
+```
+
+`make help` lists all targets. Dataset partitions load with `streaming=True` (see dataset card / ADR-03).
 
 Make sure `~/.local/bin` is in your `$PATH`:
 
@@ -63,7 +74,8 @@ Example:
 hf_repo = "YOUR_USER/voice-memories"
 hf_private = true
 sync_interval = 3600          # documented brew detect/process cadence (informational)
-upload_interval = 604800      # seconds between Hub publishes (default: 1 week)
+upload_interval = 604800      # seconds between empty Hub republish gating (default: 1 week)
+upload_batch_size = 2         # parquet partitions per Hub commit
 log_level = "info"
 shard_dir = "~/.local/share/vmc/shards"
 keep_uploaded_shards = false
@@ -72,7 +84,8 @@ keep_uploaded_shards = false
 | Key | Role |
 |-----|------|
 | `sync_interval` | Documents the intended detect/process cadence. Homebrew `interval 3600` owns the actual schedule. |
-| `upload_interval` | Minimum seconds between Hub uploads (default `604800`). Detect/process still run every service tick. |
+| `upload_interval` | Cadence gate when nothing is missing on Hub (default `604800`). Missing partitions always upload. |
+| `upload_batch_size` | Partitions per Hub API commit (default `2`). |
 
 ### DJI Mic recordings (optional)
 
@@ -106,8 +119,9 @@ min_age_seconds = 120
 vmc --help
 vmc status
 vmc daemon                 # [dji pull if enabled] → detect → process → upload
-vmc daemon --force-upload  # always attempt upload this pass
-vmc upload --force         # publish ready shards now
+vmc daemon --force-upload  # ignore upload_interval cadence
+vmc upload                 # Hub API: missing data/*.parquet partitions only
+vmc upload --force         # same filter; cadence-only force
 vmc dji --help             # USB pull / detect / eject / watch
 ```
 
@@ -116,5 +130,7 @@ Only one daemon/upload instance runs at a time (`~/.local/share/vmc/vmc.lock`).
 ## Design notes
 
 - Apple’s `CloudRecordings.db` is **snapshotted** (main DB + WAL/SHM) and released before any Hugging Face network I/O, so Voice Memos is not held open during uploads or remote dedup.
-- Ready shards are published in **one** git clone/commit/push batch.
-- When `uv` or `python3` plus `scripts/fix_hf_parquet.py` are available, shards are rewritten with Hugging Face Audio footer metadata before push (Dataset Viewer).
+- Hub layout is **partitioned** `data/*.parquet` with HF `Audio` columns — load with `streaming=True` for iterable access. See [adr/03-hub-partitioned-upload.md](adr/03-hub-partitioned-upload.md).
+- Ready partitions publish via **Hub API batches** (`scripts/upload_hf_shards.py`), not a full-repo git-LFS push.
+- When `uv` or `python3` plus `scripts/fix_hf_parquet.py` are available, shards get Hugging Face Audio footer metadata before push (Dataset Viewer).
+- Service logs: `$(brew --prefix)/var/log/vmc.log`.

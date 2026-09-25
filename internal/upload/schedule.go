@@ -74,3 +74,23 @@ func MarkUploaded(cfg *config.Config) error {
 	}
 	return os.WriteFile(path, []byte(fmt.Sprintf("%d\n", time.Now().Unix())), 0600)
 }
+
+// LastUploadTime returns the recorded last successful upload time, or zero.
+func LastUploadTime(cfg *config.Config) (time.Time, error) {
+	path, err := lastUploadPath(cfg)
+	if err != nil {
+		return time.Time{}, err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return time.Time{}, nil
+		}
+		return time.Time{}, err
+	}
+	sec, err := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+	if err != nil {
+		return time.Time{}, nil
+	}
+	return time.Unix(sec, 0), nil
+}

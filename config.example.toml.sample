@@ -3,6 +3,8 @@
 hf_token = "hf_YOUR_TOKEN"
 hf_repo = "YOUR_USER/voice-memories"
 hf_private = true
+upload_interval = 604800
+upload_batch_size = 2   # shards per Hub commit
 
 [dji]
 enabled = false

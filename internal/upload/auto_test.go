@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/jborkowski/vmc/internal/config"
@@ -33,6 +32,34 @@ func TestFilterMissingRemoteAllPresent(t *testing.T) {
 	got := filterMissingRemote(local, remote)
 	if len(got) != 0 {
 		t.Fatalf("expected empty, got %v", got)
+	}
+}
+
+func TestBatchPaths(t *testing.T) {
+	paths := []string{"a", "b", "c", "d", "e"}
+	got := batchPaths(paths, 2)
+	if len(got) != 3 || len(got[0]) != 2 || len(got[1]) != 2 || len(got[2]) != 1 {
+		t.Fatalf("got %#v", got)
+	}
+	got = batchPaths(paths, 0) // default size
+	if len(got) != 3 {
+		t.Fatalf("default batch size: %#v", got)
+	}
+	if batchPaths(nil, 2) != nil {
+		t.Fatal("empty should be nil")
+	}
+}
+
+func TestForceDoesNotSkipRemoteFilter(t *testing.T) {
+	// Simulate RunWithOptions remote filter: force must not re-select present shards.
+	local := []string{"/data/shard_0001.parquet", "/data/shard_0002.parquet"}
+	remote := map[string]struct{}{
+		"shard_0001.parquet": {},
+		"shard_0002.parquet": {},
+	}
+	missing := filterMissingRemote(local, remote)
+	if len(missing) != 0 {
+		t.Fatalf("--force must not re-upload present partitions, got %v", missing)
 	}
 }
 
@@ -65,14 +92,20 @@ func TestListRemoteShardNamesTreePath(t *testing.T) {
 	}
 }
 
-func TestAuthenticatedRepoURL(t *testing.T) {
-	cfg := &config.Config{HFToken: "hf_test", HFRepo: "j14i/voice-memories"}
-	url := authenticatedDatasetURL(cfg)
-	if !strings.HasPrefix(url, "https://x-access-token:hf_test@huggingface.co/datasets/j14i/voice-memories") {
-		t.Fatalf("bad url: %s", url)
+func TestRewriteEnvToken(t *testing.T) {
+	env := []string{"PATH=/bin", "HF_TOKEN=stale", "HOME=/tmp"}
+	got := rewriteEnvToken(env, "fresh")
+	found := false
+	for _, e := range got {
+		if e == "HF_TOKEN=fresh" {
+			found = true
+		}
+		if e == "HF_TOKEN=stale" {
+			t.Fatal("stale token left in env")
+		}
 	}
-	if strings.Contains(url, "Bearer") {
-		t.Fatal("must not use Bearer in git URL")
+	if !found {
+		t.Fatalf("missing fresh token: %v", got)
 	}
 }
 

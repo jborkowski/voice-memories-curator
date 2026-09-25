@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -17,20 +16,19 @@ import (
 	"github.com/jborkowski/vmc/internal/config"
 )
 
-// Run uploads all ready shards in a single git clone/commit/push.
-// Ready shards missing from Hub always publish; upload_interval only throttles
-// when everything is already remote.
+const defaultUploadBatchSize = 2
+
+// Run uploads ready shards that are missing from Hub (Hub API, batched).
 func Run(db *sql.DB, cfg *config.Config) error {
 	return RunWithOptions(db, cfg, false)
 }
 
+// RunWithOptions publishes ready shards missing from Hub.
+// force ignores upload_interval cadence only — it never re-pushes shards
+// already present on Hub by filename (partitioned data/*.parquet).
 func RunWithOptions(db *sql.DB, cfg *config.Config, force bool) error {
 	if cfg.HFToken == "" {
 		return fmt.Errorf("HFToken is required for upload. Set HF_TOKEN environment variable or hf_token in config.toml")
-	}
-
-	if _, err := exec.LookPath("git-xet"); err != nil {
-		return fmt.Errorf("git-xet not found — install it with: brew install git-xet && git xet install")
 	}
 
 	homeDir, err := os.UserHomeDir()
@@ -43,12 +41,10 @@ func RunWithOptions(db *sql.DB, cfg *config.Config, force bool) error {
 		shardDir = filepath.Join(homeDir, shardDir[2:])
 	}
 
-	localShardsPattern := filepath.Join(shardDir, "*.parquet")
-	matches, err := filepath.Glob(localShardsPattern)
+	matches, err := filepath.Glob(filepath.Join(shardDir, "*.parquet"))
 	if err != nil {
 		return fmt.Errorf("failed to glob shards: %w", err)
 	}
-
 	if len(matches) == 0 {
 		slog.Info("no shards found")
 		return nil
@@ -84,28 +80,46 @@ func RunWithOptions(db *sql.DB, cfg *config.Config, force bool) error {
 		return nil
 	}
 
-	// Automatic: only push shards Hub does not already have (no --force needed).
+	// Always filter by Hub partition names — force does not skip this.
+	remote, err := listRemoteShardNames(cfg)
+	if err != nil {
+		slog.Warn("remote shard listing failed; uploading all ready shards", "error", err)
+	} else {
+		readyShards = filterMissingRemote(readyShards, remote)
+		if len(readyShards) == 0 {
+			slog.Info("all ready shards already on Hub")
+			return nil
+		}
+	}
+
+	// Missing partitions always publish (even when cadence would block empty republish).
 	if !force {
-		remote, err := listRemoteShardNames(cfg)
-		if err != nil {
-			slog.Warn("remote shard listing failed; uploading all ready shards", "error", err)
-		} else {
-			readyShards = filterMissingRemote(readyShards, remote)
-			if len(readyShards) == 0 {
-				slog.Info("all ready shards already on Hub")
-				return nil
-			}
+		ok, cerr := ShouldUpload(cfg, false)
+		if cerr != nil {
+			slog.Warn("cadence check failed; continuing with missing shards", "error", cerr)
+		} else if !ok {
+			slog.Info("upload_interval not elapsed; still publishing missing Hub partitions",
+				"missing", len(readyShards))
 		}
 	}
 
 	slog.Info(fmt.Sprintf("%d shards ready for upload", len(readyShards)))
 
-	if err := uploadShardsBatch(db, cfg, readyShards); err != nil {
-		return err
+	batches := batchPaths(readyShards, effectiveBatchSize(cfg))
+	slog.Info("upload batches", "batches", len(batches), "batch_size", effectiveBatchSize(cfg))
+
+	var uploaded []string
+	for i, batch := range batches {
+		slog.Info("upload batch start", "batch", i+1, "of", len(batches), "shards", len(batch))
+		if err := uploadShardsBatch(db, cfg, batch); err != nil {
+			return err
+		}
+		uploaded = append(uploaded, batch...)
+		slog.Info("upload batch done", "batch", i+1, "of", len(batches))
 	}
 
 	if !cfg.KeepUploadedShards {
-		for _, shardPath := range readyShards {
+		for _, shardPath := range uploaded {
 			if err := os.Remove(shardPath); err != nil {
 				slog.Error("failed to delete uploaded shard", "shard", shardPath, "error", err)
 			} else {
@@ -121,11 +135,29 @@ func RunWithOptions(db *sql.DB, cfg *config.Config, force bool) error {
 	return nil
 }
 
-func effectiveUploadInterval(cfg *config.Config) int {
-	if cfg.UploadInterval <= 0 {
-		return defaultUploadInterval
+func effectiveBatchSize(cfg *config.Config) int {
+	if cfg.UploadBatchSize <= 0 {
+		return defaultUploadBatchSize
 	}
-	return cfg.UploadInterval
+	return cfg.UploadBatchSize
+}
+
+func batchPaths(paths []string, size int) [][]string {
+	if size <= 0 {
+		size = defaultUploadBatchSize
+	}
+	if len(paths) == 0 {
+		return nil
+	}
+	var out [][]string
+	for i := 0; i < len(paths); i += size {
+		end := i + size
+		if end > len(paths) {
+			end = len(paths)
+		}
+		out = append(out, paths[i:end])
+	}
+	return out
 }
 
 func checkConnectivity(cfg *config.Config) error {
@@ -159,82 +191,136 @@ func uploadShardsBatch(db *sql.DB, cfg *config.Config, shardPaths []string) erro
 
 	var exported []string
 	for _, shardPath := range shardPaths {
-		dest := filepath.Join(exportDir, filepath.Base(shardPath))
+		name := filepath.Base(shardPath)
+		dest := filepath.Join(exportDir, name)
+		slog.Info("exporting shard for Hub", "shard", name)
 		if err := exportHFParquet(db, shardPath, dest); err != nil {
 			return fmt.Errorf("export %s: %w", shardPath, err)
+		}
+		if st, err := os.Stat(dest); err == nil {
+			slog.Info("exported shard", "shard", name, "bytes", st.Size())
 		}
 		exported = append(exported, dest)
 	}
 
-	// Best-effort Viewer metadata rewrite before push.
-	if fixedDir, err := enrichParquetForHF(exportDir); err != nil {
+	fixedDir := ""
+	if dir, err := enrichParquetForHF(exportDir); err != nil {
 		slog.Warn("HF Viewer parquet enrichment skipped", "error", err)
-	} else if fixedDir != "" && fixedDir != exportDir {
-		exported = nil
+	} else if dir != "" && dir != exportDir {
+		fixedDir = dir
+		defer os.RemoveAll(fixedDir)
 		matches, _ := filepath.Glob(filepath.Join(fixedDir, "*.parquet"))
 		exported = matches
-		defer os.RemoveAll(fixedDir)
+		slog.Info("enriched parquet with HF Audio footer metadata", "shards", len(exported))
 	}
 
-	repoDir, err := os.MkdirTemp("", "vmc_repo_*")
+	readmeFile, err := os.CreateTemp("", "vmc_readme_*.md")
 	if err != nil {
-		return fmt.Errorf("failed to create temp repo dir: %w", err)
+		return fmt.Errorf("readme temp: %w", err)
 	}
-	defer os.RemoveAll(repoDir)
-
-	if err := cloneDatasetRepo(cfg, repoDir); err != nil {
+	readmePath := readmeFile.Name()
+	defer os.Remove(readmePath)
+	if _, err := readmeFile.WriteString(datasetCard()); err != nil {
+		readmeFile.Close()
+		return err
+	}
+	if err := readmeFile.Close(); err != nil {
 		return err
 	}
 
-	dataDir := filepath.Join(repoDir, "data")
-	if err := os.MkdirAll(dataDir, 0755); err != nil {
-		return fmt.Errorf("failed to create data dir: %w", err)
+	names := make([]string, 0, len(exported))
+	for _, p := range exported {
+		names = append(names, filepath.Base(p))
 	}
-
-	readmePath := filepath.Join(repoDir, "README.md")
-	if err := os.WriteFile(readmePath, []byte(datasetCard()), 0644); err != nil {
-		return fmt.Errorf("failed to write dataset card: %w", err)
-	}
-	_ = gitCmd(repoDir, "add", "README.md")
-
-	var names []string
-	for _, src := range exported {
-		fileName := filepath.Base(src)
-		destPath := filepath.Join(dataDir, fileName)
-		if err := copyFile(src, destPath); err != nil {
-			return fmt.Errorf("failed to write parquet to repo: %w", err)
-		}
-		if err := gitCmd(repoDir, "add", "data/"+fileName); err != nil {
-			return fmt.Errorf("git add failed: %w", err)
-		}
-		names = append(names, fileName)
-	}
-
-	_ = gitCmd(repoDir, "add", "-A")
-
 	msg := fmt.Sprintf("Upload %d shard(s): %s", len(names), strings.Join(names, ", "))
-	if err := gitCmd(repoDir, "commit", "-m", msg); err != nil {
-		if strings.Contains(err.Error(), "nothing to commit") || strings.Contains(err.Error(), "no changes added") {
-			slog.Info("shards already exist on HF with same content", "count", len(names))
-			return nil
-		}
-		return fmt.Errorf("git commit failed: %w", err)
-	}
 
-	if err := gitCmd(repoDir, "push"); err != nil {
-		if pullErr := gitCmd(repoDir, "pull", "--rebase"); pullErr == nil {
-			if retryErr := gitCmd(repoDir, "push"); retryErr == nil {
-				slog.Info("successfully uploaded shards to HF", "count", len(names), "repo", cfg.HFRepo)
-				return nil
-			} else {
-				return fmt.Errorf("git push failed after rebase: %w", retryErr)
-			}
-		}
-		return fmt.Errorf("git push failed: %w", err)
+	slog.Info("hub upload start", "shards", len(exported), "repo", cfg.HFRepo)
+	if err := hubUploadShards(cfg, exported, readmePath, msg); err != nil {
+		return err
 	}
+	slog.Info("hub upload commit ok", "shards", len(exported), "repo", cfg.HFRepo)
 
+	if err := verifyRemoteHas(cfg, names); err != nil {
+		return err
+	}
 	slog.Info("successfully uploaded shards to HF", "count", len(names), "repo", cfg.HFRepo)
 	return nil
+}
+
+func verifyRemoteHas(cfg *config.Config, names []string) error {
+	remote, err := listRemoteShardNames(cfg)
+	if err != nil {
+		return fmt.Errorf("post-upload verify: %w", err)
+	}
+	var missing []string
+	for _, n := range names {
+		if _, ok := remote[n]; !ok {
+			missing = append(missing, n)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("post-upload verify: Hub still missing %v", missing)
+	}
+	return nil
+}
+
+func hubUploadShards(cfg *config.Config, files []string, readmePath, message string) error {
+	script, err := findUploadScript()
+	if err != nil {
+		return err
+	}
+
+	args := []string{"--repo", cfg.HFRepo, "--message", message, "--readme", readmePath}
+	if cfg.HFPrivate {
+		args = append(args, "--private")
+	}
+	args = append(args, files...)
+
+	var cmd *exec.Cmd
+	if _, err := exec.LookPath("uv"); err == nil {
+		cmd = exec.Command("uv", append([]string{"run", script}, args...)...)
+	} else if _, err := exec.LookPath("python3"); err == nil {
+		cmd = exec.Command("python3", append([]string{script}, args...)...)
+	} else {
+		return fmt.Errorf("neither uv nor python3 found for Hub upload")
+	}
+
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	env := append(os.Environ(), "HF_TOKEN="+cfg.HFToken, "GIT_TERMINAL_PROMPT=0")
+	// Prefer config token over a stale shell HF_TOKEN.
+	cmd.Env = rewriteEnvToken(env, cfg.HFToken)
+
+	slog.Info("running hub upload script", "script", filepath.Base(script), "files", len(files))
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("hub upload failed: %w: %s", err, strings.TrimSpace(output.String()))
+	}
+	if s := strings.TrimSpace(output.String()); s != "" {
+		for _, line := range strings.Split(s, "\n") {
+			if line != "" {
+				slog.Info("hub upload", "line", line)
+			}
+		}
+	}
+	return nil
+}
+
+func rewriteEnvToken(env []string, token string) []string {
+	out := make([]string, 0, len(env)+1)
+	seen := false
+	for _, e := range env {
+		if strings.HasPrefix(e, "HF_TOKEN=") {
+			out = append(out, "HF_TOKEN="+token)
+			seen = true
+			continue
+		}
+		out = append(out, e)
+	}
+	if !seen {
+		out = append(out, "HF_TOKEN="+token)
+	}
+	return out
 }
 
 func exportHFParquet(db *sql.DB, shardPath, destPath string) error {
@@ -293,27 +379,31 @@ license: other
 ---
 # Voice Memories
 
-Private dataset of Apple Voice Memos, transcoded to FLAC 16kHz mono.
+Private partitioned audio dataset (Apple Voice Memos + optional DJI Mic).
+
+Each file under ` + "`data/*.parquet`" + ` is one partition/shard. Audio columns use the
+Hugging Face ` + "`Audio`" + ` feature (` + "`bytes`" + ` + ` + "`path`" + `) — FLAC 16 kHz mono in
+` + "`audio`" + `, AAC/original in ` + "`audio_original`" + `.
+
+## Load (map-style)
+
+` + "```python" + `
+from datasets import load_dataset
+ds = load_dataset("USER/voice-memories", split="train")
+` + "```" + `
+
+## Load (iterable / streaming)
+
+Partitions stream one shard at a time — preferred for large collections:
+
+` + "```python" + `
+from datasets import load_dataset
+ds = load_dataset("USER/voice-memories", split="train", streaming=True)
+for row in ds:
+    # row["audio"] is decoded on demand
+    break
+` + "```" + `
 `
-}
-
-func authenticatedDatasetURL(cfg *config.Config) string {
-	return fmt.Sprintf("https://x-access-token:%s@huggingface.co/datasets/%s", cfg.HFToken, cfg.HFRepo)
-}
-
-func cloneDatasetRepo(cfg *config.Config, repoDir string) error {
-	// HF git auth: token in URL (Bearer http.extraHeader is rejected by Hub git).
-	repoURL := authenticatedDatasetURL(cfg)
-	if err := gitCmd(repoDir, "clone", "--depth=1", repoURL, "."); err != nil {
-		createErr := createRepo(cfg)
-		if createErr != nil && !isRepoExistsErr(createErr) {
-			return fmt.Errorf("clone failed and repo creation failed: clone=%w, create=%v", err, createErr)
-		}
-		if err := gitCmd(repoDir, "clone", "--depth=1", repoURL, "."); err != nil {
-			return fmt.Errorf("clone failed after repo create/exists: %w", err)
-		}
-	}
-	return nil
 }
 
 func isRepoExistsErr(err error) bool {
@@ -324,58 +414,9 @@ func isRepoExistsErr(err error) bool {
 	return strings.Contains(s, "409") || strings.Contains(s, "already created") || strings.Contains(s, "already exist")
 }
 
-func gitCmd(dir string, args ...string) error {
-	cmd := exec.Command("git", args...)
-	cmd.Dir = dir
-	var output bytes.Buffer
-	cmd.Stdout = &output
-	cmd.Stderr = &output
-	// Avoid interactive credential prompts in launchd/SSH.
-	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("%s: %s", err, output.String())
-	}
-	return nil
-}
-
-func createRepo(cfg *config.Config) error {
-	url := fmt.Sprintf("%s/api/repos/create", cfg.HFBaseURL)
-
-	parts := strings.Split(cfg.HFRepo, "/")
-	var payload string
-	switch len(parts) {
-	case 2:
-		payload = fmt.Sprintf(`{"type": "dataset", "name": "%s", "organization": "%s", "private": %v}`,
-			parts[1], parts[0], cfg.HFPrivate)
-	default:
-		payload = fmt.Sprintf(`{"type": "dataset", "name": "%s", "private": %v}`, cfg.HFRepo, cfg.HFPrivate)
-	}
-
-	req, err := http.NewRequest("POST", url, strings.NewReader(payload))
-	if err != nil {
-		return err
-	}
-
-	req.Header.Set("Authorization", "Bearer "+cfg.HFToken)
-	req.Header.Set("Content-Type", "application/json")
-
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode == 409 {
-		return fmt.Errorf("status 409: %s", strings.TrimSpace(string(body)))
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-
-	slog.Info("created new HF dataset repo", "repo", cfg.HFRepo)
-	return nil
+// ListRemoteShardNames returns parquet basenames under data/ on the Hub.
+func ListRemoteShardNames(cfg *config.Config) (map[string]struct{}, error) {
+	return listRemoteShardNames(cfg)
 }
 
 func listRemoteShardNames(cfg *config.Config) (map[string]struct{}, error) {
@@ -417,6 +458,11 @@ func listRemoteShardNames(cfg *config.Config) (map[string]struct{}, error) {
 	return out, nil
 }
 
+// FilterMissingRemote returns local paths whose basenames are absent from remote.
+func FilterMissingRemote(local []string, remote map[string]struct{}) []string {
+	return filterMissingRemote(local, remote)
+}
+
 func filterMissingRemote(local []string, remote map[string]struct{}) []string {
 	var missing []string
 	for _, p := range local {
@@ -425,25 +471,6 @@ func filterMissingRemote(local []string, remote map[string]struct{}) []string {
 		}
 	}
 	return missing
-}
-
-func copyFile(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-
-	out, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-
-	if _, err := io.Copy(out, in); err != nil {
-		return err
-	}
-	return out.Close()
 }
 
 // enrichParquetForHF runs scripts/fix_hf_parquet.py when uv/python is available.
@@ -481,24 +508,23 @@ func enrichParquetForHF(exportDir string) (string, error) {
 		os.RemoveAll(outDir)
 		return "", fmt.Errorf("enrichment produced no parquet files")
 	}
-	slog.Info("enriched parquet with HF Audio footer metadata", "shards", len(matches))
 	return outDir, nil
 }
 
-func findFixScript() (string, error) {
+func findShareScript(name string) (string, error) {
 	candidates := []string{
-		"scripts/fix_hf_parquet.py",
+		filepath.Join("scripts", name),
 	}
 	if exe, err := os.Executable(); err == nil {
 		exeDir := filepath.Dir(exe)
 		candidates = append(candidates,
-			filepath.Join(exeDir, "fix_hf_parquet.py"),
-			filepath.Join(exeDir, "..", "share", "vmc", "fix_hf_parquet.py"),
-			filepath.Join(exeDir, "..", "..", "share", "vmc", "fix_hf_parquet.py"),
+			filepath.Join(exeDir, name),
+			filepath.Join(exeDir, "..", "share", "vmc", name),
+			filepath.Join(exeDir, "..", "..", "share", "vmc", name),
 		)
 	}
 	if home, err := os.UserHomeDir(); err == nil {
-		candidates = append(candidates, filepath.Join(home, ".local", "share", "vmc", "fix_hf_parquet.py"))
+		candidates = append(candidates, filepath.Join(home, ".local", "share", "vmc", name))
 	}
 	for _, c := range candidates {
 		if st, err := os.Stat(c); err == nil && !st.IsDir() {
@@ -509,5 +535,13 @@ func findFixScript() (string, error) {
 			return abs, nil
 		}
 	}
-	return "", fmt.Errorf("fix_hf_parquet.py not found")
+	return "", fmt.Errorf("%s not found", name)
+}
+
+func findFixScript() (string, error) {
+	return findShareScript("fix_hf_parquet.py")
+}
+
+func findUploadScript() (string, error) {
+	return findShareScript("upload_hf_shards.py")
 }

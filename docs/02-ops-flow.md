@@ -11,9 +11,10 @@ brew services (hourly)
 ```
 
 - **Detect/process:** every hour (`Formula` `interval 3600`).
-- **Upload:** automatic when local ready shards are not on Hub. No `--force` for normal use.
-- **State:** `~/.local/share/vmc/shards/`, `vmc.db`, `vmc.lock`.
-- **Config:** `~/.config/vmc/config.toml` (`hf_token`, `hf_repo`, `apple_db_path`, `[dji]`, …). Personal inbox paths and device IDs live only in that local file.
+- **Upload:** Hub API batches (`upload_batch_size`, default 2) for partitions missing under `data/*.parquet`. `--force` is cadence-only — never re-pushes names already on Hub. See [adr/03-hub-partitioned-upload.md](../adr/03-hub-partitioned-upload.md).
+- **State:** `~/.local/share/vmc/shards/`, `vmc.db`, `vmc.lock`, `last_upload`.
+- **Config:** `~/.config/vmc/config.toml` (`hf_token`, `hf_repo`, `upload_batch_size`, `[dji]`, …). Personal inbox paths and device IDs live only in that local file.
+- **Service logs:** `$(brew --prefix)/var/log/vmc.log` (often `/opt/homebrew/var/log/vmc.log`).
 
 ## DJI Mic source (optional, off by default)
 
@@ -85,8 +86,8 @@ brew services restart vmc
 
 ```bash
 vmc status
-# Hub (private): must be logged in as dataset owner, or use API with token
-tail -f ~/Library/Logs/vmc/vmc.log
+# Hub (private): token in config / HF_TOKEN
+tail -f "$(brew --prefix)/var/log/vmc.log"
 ```
 
 Healthy detect: `detect phase completed` / `no new memos` / `wrote shard`.  
@@ -95,6 +96,13 @@ Broken FDA: `grant Full Disk Access` / `operation not permitted`.
 ## Manual upload (optional)
 
 ```bash
-vmc upload          # missing shards only
-vmc upload --force  # all ready shards
+vmc upload          # partitions missing on Hub only (batched Hub API)
+vmc upload --force  # same filter; only ignores upload_interval cadence
+```
+
+Streaming / iterable load of the partitioned dataset:
+
+```python
+from datasets import load_dataset
+ds = load_dataset("YOUR_USER/voice-memories", split="train", streaming=True)
 ```

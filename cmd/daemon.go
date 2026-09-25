@@ -94,6 +94,6 @@ var daemonCmd = &cobra.Command{
 }
 
 func init() {
-	daemonCmd.Flags().BoolVar(&forceUpload, "force-upload", false, "upload ready shards even if upload_interval has not elapsed")
+	daemonCmd.Flags().BoolVar(&forceUpload, "force-upload", false, "ignore upload_interval cadence (still skips shards already on Hub)")
 	rootCmd.AddCommand(daemonCmd)
 }

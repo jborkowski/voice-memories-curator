@@ -13,6 +13,7 @@ class Vmc < Formula
     ENV["CGO_ENABLED"] = "1"
     system "go", "build", *std_go_args(ldflags: "-s -w"), "."
     (share/"vmc").install "scripts/fix_hf_parquet.py"
+    (share/"vmc").install "scripts/upload_hf_shards.py"
     (share/"vmc").install "scripts/make-fda-app.sh"
     bin.install "scripts/grant-fda.sh" => "vmc-grant-fda"
     bin.install "scripts/vmc-service.sh" => "vmc-service"
@@ -42,6 +43,9 @@ class Vmc < Formula
       Optional DJI Mic: set [dji] enabled + root (and fingerprints) locally, then
         brew services restart vmc
         vmc dji watch enable   # optional pull-on-mount; disable any old dji-mic watcher first
+
+      Logs: /opt/homebrew/var/log/vmc.log (Apple Silicon) or $(brew --prefix)/var/log/vmc.log
+      Upload publishes only partitions missing on Hub (batched Hub API). --force is cadence-only.
 
       After install, once:
         git xet install

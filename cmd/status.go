@@ -12,6 +12,8 @@ import (
 	"github.com/spf13/cobra"
 
 	_ "github.com/marcboeker/go-duckdb"
+
+	"github.com/jborkowski/vmc/internal/upload"
 )
 
 func expandHome(path string) string {
@@ -69,6 +71,7 @@ var statusCmd = &cobra.Command{
 		defer mem.Close()
 
 		var pendingRows, processedRows, readyShards int
+		var readyPaths []string
 		for _, shard := range shards {
 			shardPath := filepath.Join(shardDir, shard)
 			escaped := strings.ReplaceAll(shardPath, "'", "''")
@@ -87,6 +90,24 @@ var statusCmd = &cobra.Command{
 			processedRows += processedInShard
 			if pendingInShard == 0 && processedInShard > 0 {
 				readyShards++
+				readyPaths = append(readyPaths, shardPath)
+			}
+		}
+
+		remoteCount := -1
+		var missingNames []string
+		lastUpload := "(none)"
+		if path, err := upload.LastUploadTime(cfg); err == nil && !path.IsZero() {
+			lastUpload = path.Format(time.RFC3339)
+		}
+		if cfg.HFToken != "" && online == "Online" {
+			if remote, err := upload.ListRemoteShardNames(cfg); err != nil {
+				fmt.Fprintf(os.Stderr, "Hub tree: %v\n", err)
+			} else {
+				remoteCount = len(remote)
+				for _, p := range upload.FilterMissingRemote(readyPaths, remote) {
+					missingNames = append(missingNames, filepath.Base(p))
+				}
 			}
 		}
 
@@ -99,6 +120,21 @@ var statusCmd = &cobra.Command{
 		fmt.Println("-----------------")
 		fmt.Printf("Network:        %s\n", online)
 		fmt.Printf("Dataset:        %s\n", hfURL)
+		if remoteCount >= 0 {
+			fmt.Printf("Hub parquet:    %d\n", remoteCount)
+			fmt.Printf("Missing on Hub: %d\n", len(missingNames))
+			if len(missingNames) > 0 && len(missingNames) <= 12 {
+				fmt.Printf("  %s\n", strings.Join(missingNames, ", "))
+			} else if len(missingNames) > 12 {
+				fmt.Printf("  %s …\n", strings.Join(missingNames[:12], ", "))
+			}
+		}
+		bs := cfg.UploadBatchSize
+		if bs <= 0 {
+			bs = 2
+		}
+		fmt.Printf("Last upload:    %s\n", lastUpload)
+		fmt.Printf("Batch size:     %d\n", bs)
 		return nil
 	},
 }
