@@ -47,11 +47,11 @@ func TestFetchRemoteRecordingIDsTreePath(t *testing.T) {
 		HFRepo:    "test/repo",
 		HFBaseURL: ts.URL,
 	}
-	ids, err := fetchRemoteRecordingIDs(cfg)
+	rows, failed, err := fetchRemoteRows(cfg)
 	if err != nil {
-		t.Fatalf("fetchRemoteRecordingIDs: %v", err)
+		t.Fatalf("fetchRemoteRows: %v", err)
 	}
-	if len(ids) != 1 || ids[0] != 42 {
-		t.Fatalf("expected [42], got %v", ids)
+	if failed != 0 || len(rows) != 1 || rows[0].ID != 42 {
+		t.Fatalf("expected one row with id 42 and no failures, got %+v (failed=%d)", rows, failed)
 	}
 }

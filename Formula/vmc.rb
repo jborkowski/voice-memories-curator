@@ -1,5 +1,5 @@
 class Vmc < Formula
-  desc "Voice Memories Curator — extracts macOS Voice Memos to Hugging Face"
+  desc "Voice Memories Curator — Voice Memos (+ optional DJI Mic) → Hugging Face"
   homepage "https://github.com/jborkowski/voice-memories-curator"
   head "https://github.com/jborkowski/voice-memories-curator.git", branch: "main"
   license "MIT"
@@ -35,10 +35,13 @@ class Vmc < Formula
     <<~EOS
       Full Disk Access (required for brew services):
         vmc-grant-fda
-      Then drag ~/Desktop/vmc into the Full Disk Access list and turn it ON.
+      Then drag ~/Desktop/VMC.app into the Full Disk Access list and turn it ON.
       Docs: https://github.com/jborkowski/voice-memories-curator/blob/main/docs/02-ops-flow.md
 
       Config ~/.config/vmc/config.toml (hf_token + hf_repo). Prefer HF_TOKEN env if you wrap the service.
+      Optional DJI Mic: set [dji] enabled + root (and fingerprints) locally, then
+        brew services restart vmc
+        vmc dji watch enable   # optional pull-on-mount; disable any old dji-mic watcher first
 
       After install, once:
         git xet install

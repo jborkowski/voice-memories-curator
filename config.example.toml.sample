@@ -1,0 +1,15 @@
+# Copy to ~/.config/vmc/config.toml and fill in locally. Never commit real values.
+
+hf_token = "hf_YOUR_TOKEN"
+hf_repo = "YOUR_USER/voice-memories"
+hf_private = true
+
+[dji]
+enabled = false
+root = "~/path/to/inbox"
+device_label = "DJI Mic"
+# USB pull fingerprints (find yours with `diskutil info` / `ioreg`):
+media_name = "YOUR_MEDIA_NAME"
+volume_uuid = "00000000-0000-0000-0000-000000000000"
+usb_vendor = 0
+usb_product = 0

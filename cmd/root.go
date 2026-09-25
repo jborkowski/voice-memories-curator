@@ -30,20 +30,32 @@ var rootCmd = &cobra.Command{
 		initConfig()
 		initLogger(cmd.Name())
 
-		// Status/logs only need config (+ ephemeral DuckDB for status).
+		// Status/logs/dji only need config (+ ephemeral DuckDB for status).
 		// Never open the shared vmc.db here — the daemon may hold that lock.
-		if cmd.Name() == "logs" || cmd.Name() == "status" {
+		if skipsDB(cmd) {
 			return nil
 		}
 		return initDB()
 	},
 	PersistentPostRunE: func(cmd *cobra.Command, args []string) error {
-		if cmd.Name() == "help" || cmd.Name() == "completion" || cmd.Name() == "logs" || cmd.Name() == "status" {
+		if cmd.Name() == "help" || cmd.Name() == "completion" || skipsDB(cmd) {
 			return nil
 		}
 		cleanup()
 		return nil
 	},
+}
+
+func skipsDB(cmd *cobra.Command) bool {
+	if cmd.Name() == "logs" || cmd.Name() == "status" {
+		return true
+	}
+	for c := cmd; c != nil; c = c.Parent() {
+		if c == djiCmd {
+			return true
+		}
+	}
+	return false
 }
 
 func Execute() error {

@@ -1,6 +1,9 @@
 package process
 
 import (
+	"bytes"
+	"database/sql"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -94,6 +97,107 @@ func TestProcessMissingFile(t *testing.T) {
 	}
 	if nullAudioCount != 1 {
 		t.Errorf("expected 1 null audio row, got %d", nullAudioCount)
+	}
+}
+
+func writePendingShard(t *testing.T, db *sql.DB, shardPath string, id int64, audioPath string) {
+	t.Helper()
+	q := fmt.Sprintf(`
+		COPY (
+			SELECT
+				CAST(%d AS BIGINT) AS recording_id,
+				CAST(NULL AS BLOB) AS audio,
+				CAST(NULL AS BLOB) AS audio_original,
+				CAST('%s' AS VARCHAR) AS audio_path,
+				CAST(NULL AS VARCHAR) AS title,
+				CAST('2026-09-25T15:58:00Z' AS VARCHAR) AS created_at,
+				CAST(1.0 AS DOUBLE) AS duration_seconds,
+				CAST(NULL AS VARCHAR) AS transcription,
+				CAST(NULL AS DOUBLE) AS latitude,
+				CAST(NULL AS DOUBLE) AS longitude,
+				CAST(NULL AS VARCHAR) AS place_name,
+				CAST('DJI Mic' AS VARCHAR) AS device,
+				CAST('2026-09-25-17-58/DJI_Audio_001' AS VARCHAR) AS folder
+		) TO '%s' (FORMAT PARQUET, ROW_GROUP_SIZE 1)
+	`, id, strings.ReplaceAll(audioPath, "'", "''"), strings.ReplaceAll(shardPath, "'", "''"))
+	if _, err := db.Exec(q); err != nil {
+		t.Fatalf("failed to write shard: %v", err)
+	}
+}
+
+func TestProcessDJIWav(t *testing.T) {
+	checkFfmpeg(t)
+
+	srcDir := t.TempDir()
+	wavPath := filepath.Join(srcDir, "DJI_01_20260925_175800.WAV")
+	gen := exec.Command("ffmpeg", "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=1:sample_rate=48000", "-ac", "2", "-c:a", "pcm_s24le", "-y", wavPath)
+	if out, err := gen.CombinedOutput(); err != nil {
+		t.Fatalf("failed to generate wav: %v: %s", err, out)
+	}
+
+	shardDir := t.TempDir()
+	cfg := testutil.SetupConfig(t, "https://example.com", filepath.Join(srcDir, "unused.db"), shardDir)
+	db := testutil.GetDuckDB(t)
+
+	const id = int64(1_000_000_000_000 + 5*1000 + 1)
+	shardPath := filepath.Join(shardDir, "shard_0001.parquet")
+	writePendingShard(t, db, shardPath, id, wavPath)
+
+	if err := Run(db, cfg); err != nil {
+		t.Fatalf("process Run failed: %v", err)
+	}
+
+	var audio, orig []byte
+	var transcription sql.NullString
+	if err := db.QueryRow("SELECT audio, audio_original, transcription FROM '"+shardPath+"'").Scan(&audio, &orig, &transcription); err != nil {
+		t.Fatalf("failed to read shard: %v", err)
+	}
+	if !bytes.HasPrefix(audio, []byte("fLaC")) {
+		t.Errorf("audio is not FLAC (prefix %q)", audio[:min(4, len(audio))])
+	}
+	if len(orig) < 12 || string(orig[4:8]) != "ftyp" || string(orig[8:11]) != "M4A" {
+		t.Errorf("audio_original is not an M4A container (header %q)", orig[:min(12, len(orig))])
+	}
+	if transcription.Valid {
+		t.Errorf("expected NULL transcription for DJI, got %q", transcription.String)
+	}
+
+	origPath := filepath.Join(t.TempDir(), "orig.m4a")
+	if err := os.WriteFile(origPath, orig, 0644); err != nil {
+		t.Fatal(err)
+	}
+	probe, err := exec.Command("ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=codec_name", "-of", "csv=p=0", origPath).Output()
+	if err == nil && strings.TrimSpace(string(probe)) != "aac" {
+		t.Errorf("audio_original codec = %q, want aac", strings.TrimSpace(string(probe)))
+	}
+}
+
+func TestProcessDJIWavCorruptSkipped(t *testing.T) {
+	checkFfmpeg(t)
+
+	srcDir := t.TempDir()
+	wavPath := filepath.Join(srcDir, "DJI_01_20260925_175800.WAV")
+	if err := os.WriteFile(wavPath, []byte("not a wav"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	shardDir := t.TempDir()
+	cfg := testutil.SetupConfig(t, "https://example.com", filepath.Join(srcDir, "unused.db"), shardDir)
+	db := testutil.GetDuckDB(t)
+
+	shardPath := filepath.Join(shardDir, "shard_0001.parquet")
+	writePendingShard(t, db, shardPath, 42, wavPath)
+
+	if err := Run(db, cfg); err != nil {
+		t.Fatalf("process Run failed: %v", err)
+	}
+
+	var nullBoth int
+	if err := db.QueryRow("SELECT COUNT(*) FROM '" + shardPath + "' WHERE audio IS NULL AND audio_original IS NULL").Scan(&nullBoth); err != nil {
+		t.Fatalf("failed to read shard: %v", err)
+	}
+	if nullBoth != 1 {
+		t.Errorf("expected corrupt DJI row to stay unprocessed, got %d NULL rows", nullBoth)
 	}
 }
 

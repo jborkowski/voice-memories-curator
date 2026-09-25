@@ -1,6 +1,6 @@
 # Voice Memories Curator (vmc)
 
-A macOS daemon that periodically extracts macOS Voice Memos, transcodes audio to FLAC, and uploads Parquet shards to a private Hugging Face dataset.
+A macOS daemon that periodically extracts macOS Voice Memos (and, optionally, DJI Mic recordings), transcodes audio to FLAC, and uploads Parquet shards to a private Hugging Face dataset.
 
 Detect/process/upload run hourly via `brew services`. Upload pushes only shards that are missing from Hugging Face. Ops details: [docs/02-ops-flow.md](docs/02-ops-flow.md).
 
@@ -74,14 +74,41 @@ keep_uploaded_shards = false
 | `sync_interval` | Documents the intended detect/process cadence. Homebrew `interval 3600` owns the actual schedule. |
 | `upload_interval` | Minimum seconds between Hub uploads (default `604800`). Detect/process still run every service tick. |
 
+### DJI Mic recordings (optional)
+
+Optional second source: USB pull into a **local** inbox, then the same detect → process → upload path. Off by default. Paths, device fingerprints, and labels belong in **your** `~/.config/vmc/config.toml` only — they are not baked into the public defaults.
+
+```bash
+vmc dji detect                 # fingerprints / is it mounted?
+vmc dji pull                   # copy (defaults from [dji])
+vmc dji pull --keep --no-eject
+vmc dji eject
+vmc dji watch enable           # optional: pull on /Volumes change
+```
+
+If you previously used a separate `dji-mic` launchd watcher, disable it before `vmc dji watch enable` so the two do not race.
+
+```toml
+[dji]
+enabled = false
+root = "~/path/to/your/dji-inbox"   # set locally; do not commit real paths
+dir_glob = "????-??-??-??-??/DJI_Audio_*"
+device_label = "DJI Mic"            # optional parquet device tag
+min_age_seconds = 120
+# media_name / volume_uuid / usb_vendor / usb_product — set locally for USB pull
+```
+
+`[dji]` is **where to pull from**. **Where to push** is always top-level `hf_repo` / `hf_token` / `hf_private`. See [adr/02-dji-source.md](adr/02-dji-source.md).
+
 ## Running
 
 ```bash
 vmc --help
 vmc status
-vmc daemon                 # detect → process → upload (if interval elapsed)
+vmc daemon                 # [dji pull if enabled] → detect → process → upload
 vmc daemon --force-upload  # always attempt upload this pass
 vmc upload --force         # publish ready shards now
+vmc dji --help             # USB pull / detect / eject / watch
 ```
 
 Only one daemon/upload instance runs at a time (`~/.local/share/vmc/vmc.lock`).

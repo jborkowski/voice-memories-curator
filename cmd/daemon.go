@@ -5,11 +5,13 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/jborkowski/vmc/internal/detect"
+	"github.com/jborkowski/vmc/internal/djimic"
 	"github.com/jborkowski/vmc/internal/lock"
 	"github.com/jborkowski/vmc/internal/process"
 	"github.com/jborkowski/vmc/internal/upload"
@@ -40,6 +42,21 @@ var daemonCmd = &cobra.Command{
 			}
 			if firstErr == nil {
 				firstErr = fmt.Errorf("%s: %w", phase, err)
+			}
+		}
+
+		if cfg.DJI.Enabled && strings.TrimSpace(cfg.DJI.Root) != "" {
+			start := time.Now()
+			tool := djimic.New(cfg.DJI, func(format string, args ...any) {
+				slog.Info(fmt.Sprintf(format, args...), "phase", "dji_pull")
+			})
+			opts := djimic.DefaultPullOptions(cfg.DJI)
+			opts.IfPresent = true
+			if _, err := tool.Pull(opts); err != nil {
+				slog.Error("dji pull phase failed", "phase", "dji_pull", "duration_ms", time.Since(start).Milliseconds(), "error", err)
+				noteErr("dji pull", err)
+			} else {
+				slog.Info("dji pull phase completed", "phase", "dji_pull", "duration_ms", time.Since(start).Milliseconds())
 			}
 		}
 

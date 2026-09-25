@@ -11,7 +11,9 @@ import (
 
 func main() {
 	if err := cmd.Execute(); err != nil {
-		slog.Error("execution failed", "error", err)
+		if !cmd.IsReported(err) {
+			slog.Error("execution failed", "error", err)
+		}
 		os.Exit(1)
 	}
 }

@@ -128,43 +128,38 @@ func processShard(db *sql.DB, shardPath string) (int, int, error) {
 		}
 
 		tempFlacPath := filepath.Join(tempDir, fmt.Sprintf("%d.flac", p.id))
-
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-
-		cmd := exec.CommandContext(ctx, "ffmpeg",
-			"-i", p.path,
-			"-ac", "1",
-			"-ar", "16000",
-			"-f", "flac",
-			"-y",
-			tempFlacPath,
-		)
-		var stderrBuf bytes.Buffer
-		cmd.Stderr = &stderrBuf
-
-		if err := cmd.Run(); err != nil {
-			slog.Warn("ffmpeg transcode failed, skipping", "error", err, "recording_id", p.id, "stderr", stderrBuf.String())
+		if err := transcodeFLAC(p.path, tempFlacPath); err != nil {
+			slog.Warn("ffmpeg transcode failed, skipping", "error", err, "recording_id", p.id)
 			skipped++
-			cancel()
 			continue
 		}
-		cancel()
 
-		// Copy the original .m4a into tempDir so DuckDB can read_blob it
 		origCopyPath := filepath.Join(tempDir, fmt.Sprintf("%d.m4a", p.id))
-		origData, err := os.ReadFile(p.path)
-		if err != nil {
-			slog.Warn("failed to read original file, skipping audio_original", "error", err, "recording_id", p.id)
-		} else {
-			if err := os.WriteFile(origCopyPath, origData, 0644); err != nil {
+		var transcript string
+
+		if isAppleAudio(p.path) {
+			// Copy the original .m4a into tempDir so DuckDB can read_blob it
+			origData, err := os.ReadFile(p.path)
+			if err != nil {
+				slog.Warn("failed to read original file, skipping audio_original", "error", err, "recording_id", p.id)
+				origCopyPath = ""
+			} else if err := os.WriteFile(origCopyPath, origData, 0644); err != nil {
 				slog.Warn("failed to write original copy", "error", err, "recording_id", p.id)
 				origCopyPath = ""
 			}
-		}
 
-		transcript, err := extractTranscript(p.path)
-		if err != nil {
-			slog.Debug("no transcript extracted", "recording_id", p.id, "error", err)
+			transcript, err = extractTranscript(p.path)
+			if err != nil {
+				slog.Debug("no transcript extracted", "recording_id", p.id, "error", err)
+			}
+		} else {
+			// Consumers (lazy-notes) assume audio_original is .m4a, so a row
+			// without it must not be published; leave audio NULL to retry.
+			if err := transcodeAAC(p.path, origCopyPath); err != nil {
+				slog.Warn("ffmpeg AAC transcode failed, skipping", "error", err, "recording_id", p.id, "audio_path", p.path)
+				skipped++
+				continue
+			}
 		}
 
 		rowData[p.id] = &processedRow{
@@ -239,6 +234,40 @@ func processShard(db *sql.DB, shardPath string) (int, int, error) {
 	slog.Info("processed shard", "shard", shardPath, "processed", processed, "skipped", skipped)
 
 	return processed, skipped, nil
+}
+
+// isAppleAudio reports whether path is a Voice Memos container that is
+// already .m4a-compatible and may carry a tsrp transcript atom.
+func isAppleAudio(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".m4a", ".qta":
+		return true
+	}
+	return false
+}
+
+// transcodeFLAC writes the 16 kHz mono FLAC used for the audio column.
+func transcodeFLAC(src, dst string) error {
+	return runFFmpeg("-i", src, "-ac", "1", "-ar", "16000", "-f", "flac", "-y", dst)
+}
+
+// transcodeAAC writes an AAC .m4a for audio_original from a non-Apple
+// source (e.g. DJI WAV), keeping the source channels and sample rate.
+func transcodeAAC(src, dst string) error {
+	return runFFmpeg("-i", src, "-vn", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", "-f", "ipod", "-y", dst)
+}
+
+func runFFmpeg(args ...string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "ffmpeg", append([]string{"-nostdin", "-loglevel", "error"}, args...)...)
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = &stderrBuf
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("ffmpeg %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(stderrBuf.String()))
+	}
+	return nil
 }
 
 // extractTranscript reads an .m4a/.qta file and extracts the transcript
