@@ -39,7 +39,7 @@ vmc dji pull → local inbox/*.WAV → detect → process → upload → hf_repo
 | `vmc dji eject` | Safely eject the transmitter |
 | `vmc dji watch enable\|disable\|status` | Optional launchd `WatchPaths` on `/Volumes` → `pull --if-present --quiet` on plug |
 
-The watcher plist prefers `~/Applications/VMC.app/.../vmc` (or `vmc-service`) so Full Disk Access matches brew services. Run `vmc-grant-fda` first.
+The watcher plist uses `vmc-service` (or the stable `vmc` binary) so Full Disk Access matches brew services. Run `vmc-grant-fda` first.
 
 **Migrating from the bash `dji-mic` tool:** disable the old watcher before enabling vmc’s (`dji-mic watch disable`, then `vmc dji watch enable`). The tools use different lock paths and will race if both are armed.
 
@@ -55,21 +55,19 @@ launchd runs `/opt/homebrew/opt/vmc/bin/vmc`. That binary must have **Full Disk 
 
 (or the classic `Application Support/com.apple.voicememos/...` path).
 
-### Drag shortcut (recommended)
+### Full Disk Access setup
 
 ```bash
 vmc-grant-fda
 # or: make permissions
 ```
 
-This builds **`~/Desktop/VMC.app`** (+ `~/Applications/VMC.app`), reveals it, opens **Full Disk Access**.
+This reveals the `vmc` binary in Finder and opens **Full Disk Access**.
 
 Then:
 
-1. Drag **`VMC.app`** into the FDA list → toggle ON  
+1. Add `vmc` to the Full Disk Access list (drag from Finder or use `+`) → toggle ON  
 2. `brew services restart vmc`
-
-`brew services` runs `vmc-service` → `~/Applications/VMC.app/Contents/Resources/vmc` (inside the app you granted). After upgrades, run `vmc-grant-fda` again to refresh the app binary.
 
 ## Install / upgrade
 
@@ -78,7 +76,7 @@ brew tap jborkowski/vmc https://github.com/jborkowski/voice-memories-curator
 brew uninstall --ignore-dependencies vmc 2>/dev/null || true
 brew install --HEAD --formula jborkowski/vmc/vmc
 git xet install
-vmc-grant-fda   # drag Desktop/vmc into FDA
+vmc-grant-fda
 brew services restart vmc
 ```
 

@@ -47,20 +47,9 @@ func NewWatch(logFile string) (*Watch, error) {
 
 var cellarRe = regexp.MustCompile(`^(.*)/Cellar/vmc/[^/]+/bin/vmc$`)
 
-// preferServiceBinary mirrors brew services: prefer the FDA-granted VMC.app
-// binary, else vmc-service (which re-resolves to that app), else the stable
-// Homebrew opt path. Plain Cellar/opt binaries often lack Full Disk Access,
-// so /Volumes and iCloud destinations fail silently under launchd.
+// preferServiceBinary returns vmc-service if present in the same directory,
+// else resolves the stable Homebrew opt path so the agent survives brew upgrade.
 func preferServiceBinary(home, bin string) string {
-	for _, rel := range []string{
-		"Applications/VMC.app/Contents/Resources/vmc",
-		"Desktop/VMC.app/Contents/Resources/vmc",
-	} {
-		p := filepath.Join(home, rel)
-		if isExecutable(p) {
-			return p
-		}
-	}
 	stable := stableBinary(bin)
 	for _, dir := range []string{filepath.Dir(stable), filepath.Dir(bin)} {
 		svc := filepath.Join(dir, "vmc-service")

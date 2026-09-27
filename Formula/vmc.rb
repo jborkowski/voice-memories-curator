@@ -14,13 +14,11 @@ class Vmc < Formula
     system "go", "build", *std_go_args(ldflags: "-s -w"), "."
     (share/"vmc").install "scripts/fix_hf_parquet.py"
     (share/"vmc").install "scripts/upload_hf_shards.py"
-    (share/"vmc").install "scripts/make-fda-app.sh"
     bin.install "scripts/grant-fda.sh" => "vmc-grant-fda"
     bin.install "scripts/vmc-service.sh" => "vmc-service"
   end
 
   service do
-    # Prefer ~/Applications/VMC.app binary (FDA drag target). See vmc-grant-fda.
     run [opt_bin/"vmc-service", "daemon"]
     working_dir HOMEBREW_PREFIX
     environment_variables PATH: "#{HOMEBREW_PREFIX}/bin:#{HOMEBREW_PREFIX}/sbin:/usr/bin:/bin:/usr/sbin:/sbin",
@@ -36,7 +34,6 @@ class Vmc < Formula
     <<~EOS
       Full Disk Access (required for brew services):
         vmc-grant-fda
-      Then drag ~/Desktop/VMC.app into the Full Disk Access list and turn it ON.
       Docs: https://github.com/jborkowski/voice-memories-curator/blob/main/docs/02-ops-flow.md
 
       Config ~/.config/vmc/config.toml (hf_token + hf_repo). Prefer HF_TOKEN env if you wrap the service.

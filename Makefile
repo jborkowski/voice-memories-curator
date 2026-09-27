@@ -31,9 +31,9 @@ help:
 	@echo "  make test            go test ./..."
 	@echo "  make build           CGO binary ./vmc"
 	@echo "  make install         install binary + share scripts to $(PREFIX)"
-	@echo "  make permissions     build VMC.app for Full Disk Access"
+	@echo "  make permissions     open Full Disk Access"
 	@echo "  make brew-reinstall  brew uninstall + install --HEAD $(TAP)"
-	@echo "  make brew-restart    brew services restart vmc + refresh FDA app"
+	@echo "  make brew-restart    brew services restart vmc"
 	@echo "  make brew-status     brew services info + vmc status"
 	@echo "  make logs            tail -f $(LOG)"
 	@echo "  make check           test + build (pre-push)"
@@ -62,7 +62,6 @@ install: build
 	install -m 755 scripts/vmc-service.sh $(PREFIX)/bin/vmc-service
 	install -m 644 scripts/fix_hf_parquet.py $(PREFIX)/share/vmc/fix_hf_parquet.py
 	install -m 644 scripts/upload_hf_shards.py $(PREFIX)/share/vmc/upload_hf_shards.py
-	install -m 755 scripts/make-fda-app.sh $(PREFIX)/share/vmc/make-fda-app.sh
 	@echo "Installed $(PREFIX)/bin/vmc"
 	@echo "Share scripts: fix_hf_parquet.py upload_hf_shards.py → $(PREFIX)/share/vmc/"
 	@echo "Ensure PATH includes $(PREFIX)/bin"
@@ -81,7 +80,6 @@ brew-reinstall:
 	@echo "Next: make brew-restart && make permissions"
 
 brew-restart:
-	vmc-grant-fda || bash scripts/grant-fda.sh
 	brew services restart vmc
 	@echo "Service log: $(LOG)"
 

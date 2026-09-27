@@ -61,7 +61,11 @@ export PATH="$HOME/.local/bin:$PATH"
 vmc-grant-fda
 ```
 
-Creates **`Desktop/VMC.app`**. Drag it into Full Disk Access → ON → `brew services restart vmc`.
+Reveals `vmc` in Finder and opens **Full Disk Access**. Add `vmc` to the list and toggle ON, then:
+
+```bash
+brew services restart vmc
+```
 
 ## Configuration
 

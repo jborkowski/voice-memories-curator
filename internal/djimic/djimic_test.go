@@ -438,12 +438,6 @@ func TestPreferServiceBinary(t *testing.T) {
 	if got := preferServiceBinary(home, vmc); got != svc {
 		t.Errorf("vmc-service: got %s want %s", got, svc)
 	}
-
-	app := filepath.Join(home, "Applications", "VMC.app", "Contents", "Resources", "vmc")
-	writeExec(t, app, "")
-	if got := preferServiceBinary(home, plain); got != app {
-		t.Errorf("VMC.app: got %s want %s", got, app)
-	}
 }
 
 func writeExec(t *testing.T, path, body string) {
