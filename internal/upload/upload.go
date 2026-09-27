@@ -118,6 +118,25 @@ func RunWithOptions(db *sql.DB, cfg *config.Config, force bool) error {
 		slog.Info("upload batch done", "batch", i+1, "of", len(batches))
 	}
 
+	for _, shardPath := range uploaded {
+		name := filepath.Base(shardPath)
+		escaped := strings.ReplaceAll(shardPath, "'", "''")
+		escapedName := strings.ReplaceAll(name, "'", "''")
+		_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS remote_dedup_cache (
+			shard_name VARCHAR,
+			recording_id BIGINT,
+			device VARCHAR,
+			created_at VARCHAR,
+			duration_seconds DOUBLE,
+			PRIMARY KEY (shard_name, recording_id)
+		)`)
+		_, _ = db.Exec(fmt.Sprintf(`
+			INSERT OR IGNORE INTO remote_dedup_cache
+			SELECT '%s', recording_id, device, created_at, duration_seconds
+			FROM read_parquet('%s')
+		`, escapedName, escaped))
+	}
+
 	if !cfg.KeepUploadedShards {
 		for _, shardPath := range uploaded {
 			if err := os.Remove(shardPath); err != nil {

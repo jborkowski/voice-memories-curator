@@ -167,8 +167,8 @@ func TestProcessDJIWav(t *testing.T) {
 		t.Fatal(err)
 	}
 	probe, err := exec.Command("ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=codec_name", "-of", "csv=p=0", origPath).Output()
-	if err == nil && strings.TrimSpace(string(probe)) != "aac" {
-		t.Errorf("audio_original codec = %q, want aac", strings.TrimSpace(string(probe)))
+	if err == nil && strings.TrimSpace(string(probe)) != "alac" {
+		t.Errorf("audio_original codec = %q, want alac", strings.TrimSpace(string(probe)))
 	}
 }
 

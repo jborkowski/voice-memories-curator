@@ -155,8 +155,9 @@ func processShard(db *sql.DB, shardPath string) (int, int, error) {
 		} else {
 			// Consumers (lazy-notes) assume audio_original is .m4a, so a row
 			// without it must not be published; leave audio NULL to retry.
-			if err := transcodeAAC(p.path, origCopyPath); err != nil {
-				slog.Warn("ffmpeg AAC transcode failed, skipping", "error", err, "recording_id", p.id, "audio_path", p.path)
+			// Use ALAC (Apple Lossless Audio Codec) to preserve 100% bit-exact studio quality.
+			if err := transcodeALAC(p.path, origCopyPath); err != nil {
+				slog.Warn("ffmpeg ALAC transcode failed, skipping", "error", err, "recording_id", p.id, "audio_path", p.path)
 				skipped++
 				continue
 			}
@@ -251,10 +252,10 @@ func transcodeFLAC(src, dst string) error {
 	return runFFmpeg("-i", src, "-ac", "1", "-ar", "16000", "-f", "flac", "-y", dst)
 }
 
-// transcodeAAC writes an AAC .m4a for audio_original from a non-Apple
-// source (e.g. DJI WAV), keeping the source channels and sample rate.
-func transcodeAAC(src, dst string) error {
-	return runFFmpeg("-i", src, "-vn", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", "-f", "ipod", "-y", dst)
+// transcodeALAC writes an ALAC .m4a for audio_original from a non-Apple
+// source (e.g. DJI WAV), keeping the source channels, sample rate, and bit depth losslessly.
+func transcodeALAC(src, dst string) error {
+	return runFFmpeg("-i", src, "-vn", "-c:a", "alac", "-movflags", "+faststart", "-f", "ipod", "-y", dst)
 }
 
 func runFFmpeg(args ...string) error {

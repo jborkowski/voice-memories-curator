@@ -46,6 +46,19 @@ func Run(db *sql.DB, cfg *config.Config) error {
 	defer db.Exec("DROP TABLE IF EXISTS apple_snapshot")
 	defer db.Exec("DROP TABLE IF EXISTS pending")
 
+	localShardsPattern := filepath.Join(shardDir, "*.parquet")
+	matches, _ := filepath.Glob(localShardsPattern)
+	localComplete := true
+	var localRows []knownRow
+	if len(matches) > 0 {
+		rows, err := readLocalRows(db, localShardsPattern)
+		if err != nil {
+			slog.Warn("failed to read local shards for dedup", "error", err)
+			localComplete = false
+		}
+		localRows = rows
+	}
+
 	// Collect dedup state BEFORE touching Apple's DB so network I/O never
 	// overlaps with a live ATTACH on CloudRecordings.db.
 	dedupMode := "local+hf"
@@ -55,7 +68,7 @@ func Run(db *sql.DB, cfg *config.Config) error {
 	remoteMaxShard := 0
 	var remoteRows []knownRow
 	if cfg.HFToken != "" && cfg.HFRepo != "" {
-		rows, failedFiles, maxShard, err := fetchRemoteRows(cfg)
+		rows, failedFiles, maxShard, err := fetchRemoteRows(db, cfg, matches)
 		if err != nil {
 			slog.Warn("HF remote dedup failed, falling back to local-only", "error", err)
 			dedupMode = "local-only"
@@ -69,19 +82,6 @@ func Run(db *sql.DB, cfg *config.Config) error {
 		}
 	} else {
 		dedupMode = "local-only"
-	}
-
-	localShardsPattern := filepath.Join(shardDir, "*.parquet")
-	matches, _ := filepath.Glob(localShardsPattern)
-	localComplete := true
-	var localRows []knownRow
-	if len(matches) > 0 {
-		rows, err := readLocalRows(db, localShardsPattern)
-		if err != nil {
-			slog.Warn("failed to read local shards for dedup", "error", err)
-			localComplete = false
-		}
-		localRows = rows
 	}
 
 	known := append(remoteRows, localRows...)
@@ -546,8 +546,41 @@ func createKnownAppleTable(db *sql.DB, ids []int64) error {
 
 // fetchRemoteRows lists data/*.parquet on the Hub and returns their dedup
 // rows, how many files could not be read, and the highest numbered shard.
-func fetchRemoteRows(cfg *config.Config) ([]knownRow, int, int, error) {
-	client := &http.Client{Timeout: 30 * time.Second}
+// It caches rows in remote_dedup_cache in DuckDB so shards are not re-downloaded.
+func fetchRemoteRows(db *sql.DB, cfg *config.Config, localMatches []string) ([]knownRow, int, int, error) {
+	_, _ = db.Exec(`CREATE TABLE IF NOT EXISTS remote_dedup_cache (
+		shard_name VARCHAR,
+		recording_id BIGINT,
+		device VARCHAR,
+		created_at VARCHAR,
+		duration_seconds DOUBLE,
+		PRIMARY KEY (shard_name, recording_id)
+	)`)
+
+	// Populate cache from local shards on disk so we never fetch shards we already have.
+	for _, m := range localMatches {
+		base := filepath.Base(m)
+		escaped := strings.ReplaceAll(m, "'", "''")
+		escapedBase := strings.ReplaceAll(base, "'", "''")
+		_, _ = db.Exec(fmt.Sprintf(`
+			INSERT OR IGNORE INTO remote_dedup_cache
+			SELECT '%s', recording_id, device, created_at, duration_seconds
+			FROM read_parquet('%s')
+		`, escapedBase, escaped))
+	}
+
+	cachedShards := make(map[string]bool)
+	if rows, err := db.Query("SELECT DISTINCT shard_name FROM remote_dedup_cache"); err == nil {
+		for rows.Next() {
+			var s string
+			if err := rows.Scan(&s); err == nil {
+				cachedShards[s] = true
+			}
+		}
+		rows.Close()
+	}
+
+	client := &http.Client{Timeout: 5 * time.Minute}
 
 	apiURL := fmt.Sprintf("%s/api/datasets/%s/tree/main/data", cfg.HFBaseURL, cfg.HFRepo)
 	req, err := http.NewRequest("GET", apiURL, nil)
@@ -579,7 +612,6 @@ func fetchRemoteRows(cfg *config.Config) ([]knownRow, int, int, error) {
 		return nil, 0, 0, fmt.Errorf("failed to parse HF file listing: %w", err)
 	}
 
-	var all []knownRow
 	failed := 0
 	maxShard := 0
 	for _, f := range files {
@@ -601,6 +633,10 @@ func fetchRemoteRows(cfg *config.Config) ([]knownRow, int, int, error) {
 		if _, err := fmt.Sscanf(base, "shard_%d.parquet", &shardNum); err == nil && shardNum > maxShard {
 			maxShard = shardNum
 		}
+		if cachedShards[base] {
+			continue
+		}
+
 		// Tree paths are usually "data/shard_….parquet"; siblings may be bare names.
 		resolvePath := rel
 		if !strings.Contains(rel, "/") {
@@ -613,7 +649,30 @@ func fetchRemoteRows(cfg *config.Config) ([]knownRow, int, int, error) {
 			failed++
 			continue
 		}
-		all = append(all, rows...)
+		for _, r := range rows {
+			deviceVal := "NULL"
+			if r.Device.Valid {
+				deviceVal = fmt.Sprintf("'%s'", strings.ReplaceAll(r.Device.String, "'", "''"))
+			}
+			createdVal := "NULL"
+			if r.CreatedAt.Valid {
+				createdVal = fmt.Sprintf("'%s'", strings.ReplaceAll(r.CreatedAt.String, "'", "''"))
+			}
+			durVal := "NULL"
+			if r.Duration.Valid {
+				durVal = fmt.Sprintf("%f", r.Duration.Float64)
+			}
+			_, _ = db.Exec(fmt.Sprintf(`
+				INSERT OR IGNORE INTO remote_dedup_cache (shard_name, recording_id, device, created_at, duration_seconds)
+				VALUES ('%s', %d, %s, %s, %s)
+			`, strings.ReplaceAll(base, "'", "''"), r.ID, deviceVal, createdVal, durVal))
+		}
+		cachedShards[base] = true
+	}
+
+	all, err := queryKnownRows(db, "remote_dedup_cache")
+	if err != nil {
+		return nil, failed, maxShard, err
 	}
 
 	return all, failed, maxShard, nil

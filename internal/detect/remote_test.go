@@ -47,7 +47,7 @@ func TestFetchRemoteRecordingIDsTreePath(t *testing.T) {
 		HFRepo:    "test/repo",
 		HFBaseURL: ts.URL,
 	}
-	rows, failed, maxShard, err := fetchRemoteRows(cfg)
+	rows, failed, maxShard, err := fetchRemoteRows(db, cfg, nil)
 	if err != nil {
 		t.Fatalf("fetchRemoteRows: %v", err)
 	}
