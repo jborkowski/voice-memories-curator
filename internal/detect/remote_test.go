@@ -17,7 +17,7 @@ func TestFetchRemoteRecordingIDsTreePath(t *testing.T) {
 	// Minimal parquet with recording_id via DuckDB.
 	db := testutil.GetDuckDB(t)
 	tmpDir := t.TempDir()
-	parquetPath := filepath.Join(tmpDir, "shard_0001.parquet")
+	parquetPath := filepath.Join(tmpDir, "shard_0084.parquet")
 	if _, err := db.Exec(`
 		COPY (SELECT CAST(42 AS BIGINT) AS recording_id) TO '` + parquetPath + `' (FORMAT PARQUET)
 	`); err != nil {
@@ -32,11 +32,11 @@ func TestFetchRemoteRecordingIDsTreePath(t *testing.T) {
 	mux.HandleFunc("/api/datasets/test/repo/tree/main/data", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`[
-			{"type":"file","path":"data/shard_0001.parquet","size":123},
+			{"type":"file","path":"data/shard_0084.parquet","size":123},
 			{"type":"directory","path":"data/nested"}
 		]`))
 	})
-	mux.HandleFunc("/datasets/test/repo/resolve/main/data/shard_0001.parquet", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/datasets/test/repo/resolve/main/data/shard_0084.parquet", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(parquetBytes)
 	})
 	ts := httptest.NewServer(mux)
@@ -47,11 +47,11 @@ func TestFetchRemoteRecordingIDsTreePath(t *testing.T) {
 		HFRepo:    "test/repo",
 		HFBaseURL: ts.URL,
 	}
-	rows, failed, err := fetchRemoteRows(cfg)
+	rows, failed, maxShard, err := fetchRemoteRows(cfg)
 	if err != nil {
 		t.Fatalf("fetchRemoteRows: %v", err)
 	}
-	if failed != 0 || len(rows) != 1 || rows[0].ID != 42 {
-		t.Fatalf("expected one row with id 42 and no failures, got %+v (failed=%d)", rows, failed)
+	if failed != 0 || len(rows) != 1 || rows[0].ID != 42 || maxShard != 84 {
+		t.Fatalf("expected one row with id 42, max shard 84, and no failures, got %+v (failed=%d maxShard=%d)", rows, failed, maxShard)
 	}
 }

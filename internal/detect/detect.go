@@ -52,15 +52,17 @@ func Run(db *sql.DB, cfg *config.Config) error {
 	// remoteComplete gates DJI: its dedup key and slot allocation are only
 	// safe against the full published set, so DJI fails closed.
 	remoteComplete := true
+	remoteMaxShard := 0
 	var remoteRows []knownRow
 	if cfg.HFToken != "" && cfg.HFRepo != "" {
-		rows, failedFiles, err := fetchRemoteRows(cfg)
+		rows, failedFiles, maxShard, err := fetchRemoteRows(cfg)
 		if err != nil {
 			slog.Warn("HF remote dedup failed, falling back to local-only", "error", err)
 			dedupMode = "local-only"
 			remoteComplete = false
 		} else {
 			remoteRows = rows
+			remoteMaxShard = maxShard
 			if failedFiles > 0 {
 				remoteComplete = false
 			}
@@ -147,7 +149,9 @@ func Run(db *sql.DB, cfg *config.Config) error {
 		}
 	}
 
-	maxShard := 0
+	// Local shards may have been removed after upload. Include the Hub's
+	// highest shard number so new local partitions never reuse published names.
+	maxShard := remoteMaxShard
 	for _, m := range matches {
 		name := filepath.Base(m)
 		var num int
@@ -541,28 +545,28 @@ func createKnownAppleTable(db *sql.DB, ids []int64) error {
 }
 
 // fetchRemoteRows lists data/*.parquet on the Hub and returns their dedup
-// rows plus how many files could not be read.
-func fetchRemoteRows(cfg *config.Config) ([]knownRow, int, error) {
+// rows, how many files could not be read, and the highest numbered shard.
+func fetchRemoteRows(cfg *config.Config) ([]knownRow, int, int, error) {
 	client := &http.Client{Timeout: 30 * time.Second}
 
 	apiURL := fmt.Sprintf("%s/api/datasets/%s/tree/main/data", cfg.HFBaseURL, cfg.HFRepo)
 	req, err := http.NewRequest("GET", apiURL, nil)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
 	req.Header.Set("Authorization", "Bearer "+cfg.HFToken)
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, 0, fmt.Errorf("HF API request failed: %w", err)
+		return nil, 0, 0, fmt.Errorf("HF API request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == 404 {
-		return nil, 0, nil
+		return nil, 0, 0, nil
 	}
 	if resp.StatusCode != 200 {
-		return nil, 0, fmt.Errorf("HF API returned %d", resp.StatusCode)
+		return nil, 0, 0, fmt.Errorf("HF API returned %d", resp.StatusCode)
 	}
 
 	// Hub /tree/ returns "path"; /siblings returns "rfilename". Accept both.
@@ -572,11 +576,12 @@ func fetchRemoteRows(cfg *config.Config) ([]knownRow, int, error) {
 		RfileName string `json:"rfilename"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&files); err != nil {
-		return nil, 0, fmt.Errorf("failed to parse HF file listing: %w", err)
+		return nil, 0, 0, fmt.Errorf("failed to parse HF file listing: %w", err)
 	}
 
 	var all []knownRow
 	failed := 0
+	maxShard := 0
 	for _, f := range files {
 		if f.Type != "" && f.Type != "file" {
 			continue
@@ -591,6 +596,10 @@ func fetchRemoteRows(cfg *config.Config) ([]knownRow, int, error) {
 		base := filepath.Base(rel)
 		if !strings.HasSuffix(base, ".parquet") {
 			continue
+		}
+		var shardNum int
+		if _, err := fmt.Sscanf(base, "shard_%d.parquet", &shardNum); err == nil && shardNum > maxShard {
+			maxShard = shardNum
 		}
 		// Tree paths are usually "data/shard_….parquet"; siblings may be bare names.
 		resolvePath := rel
@@ -607,7 +616,7 @@ func fetchRemoteRows(cfg *config.Config) ([]knownRow, int, error) {
 		all = append(all, rows...)
 	}
 
-	return all, failed, nil
+	return all, failed, maxShard, nil
 }
 
 func readRemoteRows(client *http.Client, token, fileURL string) ([]knownRow, error) {
